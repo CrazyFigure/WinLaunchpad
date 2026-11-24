@@ -25,6 +25,7 @@ Windows 11 上的 macOS 风格启动台。一个快捷键呼出/收起，自动�
 1. 运行 `WinLaunchpad.exe`。首次启动会在后台扫描应用（约 1 秒），并在托盘出现图标。
 2. 按 `Ctrl + Alt + Shift + A` 呼出 / 收起；输入几个字母即可搜索；`Esc` 或点击其它位置收起。
 3. 想改快捷键：托盘右键 →「设置…」→「修改…」→ 按下新组合键 → 确定。
+4. 检测更新：打开「设置 → 关于」，点击「检测更新」。发现新版本后可一键更新并重启，展开版本行可查看更新日志。
 
 ### 配合 Quicker 使用（推荐沿用你现有的手势）
 
@@ -80,7 +81,9 @@ cargo build --release
 cargo test --release
 ```
 
-产物：`target\release\winlaunchpad.exe`（约 490 KB，无运行时依赖）。`tools\make_icon.ps1` 可重新生成 `assets\app.ico`。
+产物 `target\release\winlaunchpad.exe` 为 Windows 便携版。`tools\make_icon.ps1` 可重新生成 `assets\app.ico`。
+
+发布时更新 Cargo 和 Windows 资源版本，并在 `assets/release-notes.json` 列表开头添加对应版本的日志。推送对应标签后，GitHub Actions 构建并签名 EXE，再将 Git 引用、发布说明、EXE 和签名附件同步到 CNB。
 
 ## 内置右键手势的取舍
 

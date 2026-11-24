@@ -42,6 +42,7 @@ pub const WM_APP_CMD: u32 = WM_APP + 4;
 pub const WM_APP_LAUNCH: u32 = WM_APP + 6;
 pub const WM_APP_FOCUS: u32 = WM_APP + 7;
 pub const WM_APP_WALLPAPER: u32 = WM_APP + 8;
+pub const WM_APP_UPDATE_EXIT: u32 = WM_APP + 10;
 
 const TIMER_FADE: usize = 1;
 const TIMER_SLIDE: usize = 2;
@@ -1567,6 +1568,11 @@ impl App {
             }
             WM_APP_WALLPAPER => {
                 self.on_wallpaper_done(wparam.0 != 0);
+                LRESULT(0)
+            }
+            WM_APP_UPDATE_EXIT => {
+                // 替换进程就绪后沿用托盘退出流程，确保设置已保存且全局钩子已释放。
+                self.exit();
                 LRESULT(0)
             }
             WM_APP_CMD => {

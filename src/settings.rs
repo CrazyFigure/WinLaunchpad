@@ -1,6 +1,8 @@
 ﻿//! 设置窗口：左侧多标签导航（常规设置 / 自动发现文件夹 / 鼠标手势 / 关于），
 //! 所有修改实时生效并持久化，支持大类分组 + 右侧树形展开管理应用、网格行列与图标档位调节。
 
+mod about;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -17,20 +19,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{App, WM_APP_SCAN};
+use crate::app::{App, WM_APP_SCAN, WM_APP_UPDATE_EXIT};
 use crate::catalog::{self, AppEntry, ExpiredItem};
 use crate::config::{snap_icon_size_dp, ICON_ROUNDNESS_PRESETS, ICON_SIZE_PRESETS};
 use crate::hotkey::{self, HotkeySpec};
 use crate::icons::IconWorker;
 use crate::startup;
 use crate::ui::{
-    draw_button, draw_checkbox, draw_gesture_glyph, draw_rocket_badge, draw_scrollbar, draw_text,
+    draw_button, draw_checkbox, draw_gesture_glyph, draw_scrollbar, draw_text,
     draw_toggle, draw_tooltip, make_font, rgb, BtnStyle, CheckState, DibTarget, GestureGlyph,
     Surface, TextAlign,
 };
 use crate::win32::*;
 
 const TIMER_TOOLTIP: usize = 201;
+const TIMER_UPDATE: usize = 202;
 const ID_FOLDER_SEARCH: i32 = 3001;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,8 +114,7 @@ enum Hit {
     ToggleGestureSwap,
     GestureCard(usize),
     // 关于
-    OpenGitHub,
-    OpenDataDir,
+    About(about::Action),
 }
 
 struct Dlg {
@@ -123,6 +125,7 @@ struct Dlg {
     search_edit: HWND,
     search_brush: HBRUSH,
     font_title: HFONT,
+    font_about_title: HFONT,
     font_tab: HFONT,
     font_section: HFONT,
     font_body: HFONT,
@@ -144,6 +147,7 @@ struct Dlg {
     expired_list: Vec<ExpiredItem>,
     expired_scroll: usize,
     expired_status: Option<String>,
+    about: about::State,
     hover: Hit,
     pressed: Hit,
     tip_pending: Option<(Hit, RECT, String)>,
@@ -160,7 +164,6 @@ struct Layout {
     tabs: [(Tab, RECT, &'static str); 4],
     rescan_btn: RECT,
     expired_btn: RECT,
-    content: RECT,
     // Tab General
     hk_card: RECT,
     hk_badge: RECT,
@@ -218,8 +221,7 @@ struct Layout {
     gesture_swap_toggle: RECT,
     gesture_cards: [RECT; 5],
     // Tab About
-    about_github: RECT,
-    about_datadir: RECT,
+    about: about::Layout,
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
@@ -231,6 +233,7 @@ impl Dlg {
         self.destroy_fonts();
         let s = |px: f32| (px * self.scale).round() as i32;
         self.font_title = make_font(s(14.5), 600);
+        self.font_about_title = make_font(s(25.0), 650);
         self.font_tab = make_font(s(13.5), 500);
         self.font_section = make_font(s(13.5), 600);
         self.font_body = make_font(s(13.0), 400);
@@ -247,6 +250,7 @@ impl Dlg {
         unsafe {
             for f in [
                 self.font_title,
+                self.font_about_title,
                 self.font_tab,
                 self.font_section,
                 self.font_body,
@@ -261,6 +265,7 @@ impl Dlg {
             }
         }
         self.font_title = HFONT::default();
+        self.font_about_title = HFONT::default();
     }
 
     fn layout(&self) -> Layout {
@@ -425,15 +430,11 @@ impl Dlg {
         let g4 = RECT { left: g3.right + g_gap, top: g_top2, right: g3.right + g_gap + card_w3, bottom: g_top2 + card_h };
         let gesture_cards = [g0, g1, g2, g3, g4];
 
-        // Tab About
-        let cx = (content.left + content.right) / 2;
-        let abw = s(156.0);
-        let about_github = RECT { left: cx - abw - s(8.0), top: content.top + s(210.0), right: cx - s(8.0), bottom: content.top + s(246.0) };
-        let about_datadir = RECT { left: cx + s(8.0), top: content.top + s(210.0), right: cx + s(8.0) + abw, bottom: content.top + s(246.0) };
+        let about = about::Layout::new(content, rescan_btn, self.scale);
 
         Layout {
             w, h, sidebar_w, header_h, footer_h, close_btn, tabs, rescan_btn, expired_btn,
-            content, hk_card, hk_badge, hk_mod_btn, hk_def_btn, sys_card,
+            hk_card, hk_badge, hk_mod_btn, hk_def_btn, sys_card,
             startup_row, startup_toggle, wallpaper_row, wallpaper_toggle,
             grid_card, icon_row, icon_presets, round_row, round_presets, cols_row, cols_auto_btn, cols_dec_btn, cols_val_rc, cols_inc_btn,
             rows_row, rows_auto_btn, rows_dec_btn, rows_val_rc, rows_inc_btn, layout_reset_btn,
@@ -442,7 +443,7 @@ impl Dlg {
             btn_folder_all, btn_tree_expand, btn_add_manual, btn_exp_back, btn_exp_del_all,
             app_list_rc, app_scroll_rc, app_row_h, app_vis, exp_row_h, exp_vis,
             gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle, gesture_cards,
-            about_github, about_datadir,
+            about,
         }
     }
 
@@ -854,11 +855,14 @@ impl Dlg {
                 return Hit::Tab(*t);
             }
         }
-        if inside(&l.rescan_btn, x, y) {
-            return Hit::Rescan;
-        }
-        if inside(&l.expired_btn, x, y) {
-            return Hit::CheckExpired;
+        // 关于页底部用于项目入口，其余页面继续使用原有应用管理操作。
+        if self.tab != Tab::About {
+            if inside(&l.rescan_btn, x, y) {
+                return Hit::Rescan;
+            }
+            if inside(&l.expired_btn, x, y) {
+                return Hit::CheckExpired;
+            }
         }
         match self.tab {
             Tab::General => {
@@ -1023,11 +1027,8 @@ impl Dlg {
                 }
             }
             Tab::About => {
-                if inside(&l.about_github, x, y) {
-                    return Hit::OpenGitHub;
-                }
-                if inside(&l.about_datadir, x, y) {
-                    return Hit::OpenDataDir;
+                if let Some(action) = l.about.hit(&self.about, x, y) {
+                    return Hit::About(action);
                 }
             }
         }
@@ -1058,6 +1059,7 @@ pub fn open(app: &mut App) {
             search_edit: HWND::default(),
             search_brush: CreateSolidBrush(COLORREF(0x00FF_FFFF)),
             font_title: HFONT::default(),
+            font_about_title: HFONT::default(),
             font_tab: HFONT::default(),
             font_section: HFONT::default(),
             font_body: HFONT::default(),
@@ -1079,6 +1081,7 @@ pub fn open(app: &mut App) {
             expired_list: Vec::new(),
             expired_scroll: 0,
             expired_status: None,
+            about: about::State::default(),
             hover: Hit::None,
             pressed: Hit::None,
             tip_pending: None,
@@ -1149,6 +1152,7 @@ fn register_class(hinst: HINSTANCE) {
 fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
     let next: Option<(Hit, RECT, String)> = match hit {
         Hit::Close => Some((Hit::Close, l.close_btn, "关闭设置（所有更改已自动生效）".into())),
+        Hit::About(action) => l.about.tip(action).map(|(anchor, text)| (hit, anchor, text.into())),
         Hit::IconPreset(i) => ICON_SIZE_PRESETS.get(i).map(|&(dp, name)| {
             let suffix = if dp == 56 { " · 默认" } else { "" };
             (Hit::IconPreset(i), l.icon_presets[i], format!("{name}图标 ({dp} px{suffix})"))
@@ -1380,18 +1384,20 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     let footer_bg = RECT { left: l.sidebar_w + 1, top: l.h - l.footer_h, right: l.w, bottom: l.h };
     sf.fill_rect(&footer_bg, rgb(0xFAFAFC, 1.0));
     sf.fill_rect(&RECT { left: l.sidebar_w + 1, top: l.h - l.footer_h, right: l.w, bottom: l.h - l.footer_h + 1 }, rgb(0xE5E7EB, 1.0));
-    let rescan_label = if app.scanning { "正在扫描…" } else { "重新扫描应用" };
-    draw_button(&mut sf, dc, &l.rescan_btn, rescan_label, dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::Rescan, dlg.pressed == Hit::Rescan, s);
-    draw_button(&mut sf, dc, &l.expired_btn, "检测过期图标", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::CheckExpired, dlg.pressed == Hit::CheckExpired, s);
-    let hint_rc = RECT { left: l.expired_btn.right + (12.0 * s) as i32, top: l.h - l.footer_h, right: l.w - (22.0 * s) as i32, bottom: l.h };
-    draw_text(dc, "所有修改实时生效", dlg.font_sub, &hint_rc, rgb(0x94A3B8, 1.0), TextAlign::Right, true, false);
+    if dlg.tab != Tab::About {
+        let rescan_label = if app.scanning { "正在扫描…" } else { "重新扫描应用" };
+        draw_button(&mut sf, dc, &l.rescan_btn, rescan_label, dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::Rescan, dlg.pressed == Hit::Rescan, s);
+        draw_button(&mut sf, dc, &l.expired_btn, "检测过期图标", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::CheckExpired, dlg.pressed == Hit::CheckExpired, s);
+        let hint_rc = RECT { left: l.expired_btn.right + (12.0 * s) as i32, top: l.h - l.footer_h, right: l.w - (22.0 * s) as i32, bottom: l.h };
+        draw_text(dc, "所有修改实时生效", dlg.font_sub, &hint_rc, rgb(0x94A3B8, 1.0), TextAlign::Right, true, false);
+    }
 
     // 右侧内容区
     match dlg.tab {
         Tab::General => paint_tab_general(dlg, app, &l, &mut sf, dc, s),
         Tab::Folders => paint_tab_folders(dlg, app, &l, &mut sf, dc, s),
         Tab::Gestures => paint_tab_gestures(dlg, app, &l, &mut sf, dc, s),
-        Tab::About => paint_tab_about(dlg, &l, &mut sf, dc, s),
+        Tab::About => about::paint(dlg, &l.about, &mut sf, dc),
     }
 
     // 窗口外框线
@@ -1856,20 +1862,6 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
     }
 }
 
-fn paint_tab_about(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: windows::Win32::Graphics::Gdi::HDC, s: f32) {
-    let cx = (l.content.left + l.content.right) as f32 * 0.5;
-    draw_rocket_badge(sf, cx, l.content.top as f32 + 56.0 * s, 68.0 * s, s);
-    let r1 = RECT { left: l.content.left, top: l.content.top + (104.0 * s) as i32, right: l.content.right, bottom: l.content.top + (136.0 * s) as i32 };
-    let r2 = RECT { left: l.content.left, top: l.content.top + (138.0 * s) as i32, right: l.content.right, bottom: l.content.top + (164.0 * s) as i32 };
-    let r3 = RECT { left: l.content.left, top: l.content.top + (166.0 * s) as i32, right: l.content.right, bottom: l.content.top + (192.0 * s) as i32 };
-    draw_text(dc, "WinLaunchpad", dlg.font_title, &r1, rgb(0x111827, 1.0), TextAlign::Center, false, false);
-    draw_text(dc, "v0.1.0 · CrazyFigure", dlg.font_body, &r2, rgb(0x64748B, 1.0), TextAlign::Center, false, false);
-    draw_text(dc, "Windows 11 轻量级 macOS 风格启动台", dlg.font_sub, &r3, rgb(0x94A3B8, 1.0), TextAlign::Center, false, false);
-
-    draw_button(sf, dc, &l.about_github, "项目 GitHub 仓库", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::OpenGitHub, dlg.pressed == Hit::OpenGitHub, s);
-    draw_button(sf, dc, &l.about_datadir, "打开本地配置目录", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::OpenDataDir, dlg.pressed == Hit::OpenDataDir, s);
-}
-
 /// 删除选中的过期条目（移除目录记录、清理图标缓存并尝试删除失效的本地 .lnk 文件）。
 fn delete_expired_indices(dlg: &mut Dlg, app: &mut App, indices: Vec<usize>) {
     let mut removed_ids = Vec::new();
@@ -2042,6 +2034,15 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         dlg.tip_visible = Some((*rc, text.clone()));
                         let _ = InvalidateRect(hwnd, None, false);
                     }
+                } else if wparam.0 == TIMER_UPDATE {
+                    let (done, restart) = dlg.about.poll();
+                    if done {
+                        let _ = KillTimer(hwnd, TIMER_UPDATE);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    if restart {
+                        let _ = PostMessageW(app.hwnd, WM_APP_UPDATE_EXIT, WPARAM(0), LPARAM(0));
+                    }
                 }
                 LRESULT(0)
             }
@@ -2073,7 +2074,15 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
-                if dlg.tab == Tab::Folders {
+                if dlg.tab == Tab::About {
+                    let l = dlg.layout();
+                    let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                    if dlg.about.scroll(&l.about, pt.x, pt.y, get_wheel_delta(wparam.0)) {
+                        dlg.hover = dlg.hit_test(&l, pt.x, pt.y);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                } else if dlg.tab == Tab::Folders {
                     let l = dlg.layout();
                     let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
@@ -2359,12 +2368,20 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             app.settings.gesture_swap_lr = !app.settings.gesture_swap_lr;
                             app.store.save_settings(&app.settings);
                         }
-                        Hit::OpenGitHub => {
-                            open_shell_path("open", "https://github.com/CrazyFigure/WinLaunchpad", None);
-                        }
-                        Hit::OpenDataDir => {
-                            open_shell_path("open", &app.store.dir.to_string_lossy(), None);
-                        }
+                        Hit::About(action) => match action {
+                            about::Action::Version(index) => dlg.about.toggle(&l.about, index),
+                            about::Action::GitHub => open_shell_path("open", "https://github.com/CrazyFigure/WinLaunchpad", None),
+                            about::Action::Cnb => open_shell_path("open", "https://cnb.cool/crazy-figure/WinLaunchpad", None),
+                            about::Action::DataDir => open_shell_path("open", &app.store.dir.to_string_lossy(), None),
+                            about::Action::Check | about::Action::Install => {
+                                // 更新期间清除悬停提示，仅在后台任务存在时轮询。
+                                dlg.tip_pending = None;
+                                let _ = KillTimer(hwnd, TIMER_TOOLTIP);
+                                if dlg.about.start(action) {
+                                    let _ = SetTimer(hwnd, TIMER_UPDATE, 100, None);
+                                }
+                            }
+                        },
                         _ => {}
                     }
                 }
@@ -2416,6 +2433,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             WM_DESTROY => {
                 let _ = KillTimer(hwnd, TIMER_TOOLTIP);
+                let _ = KillTimer(hwnd, TIMER_UPDATE);
                 app.modal = app.modal.saturating_sub(1);
                 app.settings_hwnd = HWND::default();
                 if !dlg.search_brush.is_invalid() {

@@ -24,6 +24,7 @@ mod settings;
 mod startup;
 mod tray;
 mod ui;
+mod update;
 mod wallpaper;
 mod win32;
 

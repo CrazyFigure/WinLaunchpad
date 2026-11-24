@@ -1,0 +1,162 @@
+name: Release and mirror to CNB
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  delete:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CNB_REMOTE: https://cnb.cool/crazy-figure/WinLaunchpad.git
+
+jobs:
+  mirror:
+    name: Mirror Git refs to CNB
+    if: github.repository == 'CrazyFigure/WinLaunchpad'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 每次从 GitHub 刷新所有引用，串行同步，避免较早的快照覆盖较新的镜像。
+    concurrency:
+      group: cnb-mirror
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push branches and tags
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CNB_TOKEN:?请配置 CNB_TOKEN 仓库密钥}"
+          # 重新获取附注标签对象，并清掉 origin/HEAD，避免把符号引用当成分支推送。
+          git fetch --force --prune --prune-tags origin
+          git remote set-head origin -d
+          # 只在本次推送时交给 Git 凭据助手，避免把令牌写入 remote URL 或磁盘配置。
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= \
+            -c 'credential.helper=!f() { if [ "$1" = get ]; then printf "username=cnb\npassword=%s\n" "$CNB_TOKEN"; fi; }; f' \
+            push --prune "$CNB_REMOTE" '+refs/remotes/origin/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+
+  build:
+    name: Build and publish Windows EXE
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: github-release-${{ github.ref_name }}
+      queue: max
+    outputs:
+      asset: ${{ steps.build.outputs.asset }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build and check version
+        id: build
+        shell: pwsh
+        run: |
+          # 发布标签须与 Cargo 包版本相同，并检查 EXE 确实内嵌了对应的 Windows 版本资源。
+          $metadata = rustup run stable cargo metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { throw '读取 Cargo 包信息失败' }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "发布标签 $env:GITHUB_REF_NAME 与 Cargo 版本 $version 不一致"
+          }
+          rustup run stable cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Windows EXE 构建失败' }
+          $exe = Get-Item 'target/x86_64-pc-windows-msvc/release/winlaunchpad.exe'
+          $info = $exe.VersionInfo
+          $fileVersion = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)"
+          $productVersion = "$($info.ProductMajorPart).$($info.ProductMinorPart).$($info.ProductBuildPart)"
+          $numericVersion = [regex]::Match($version, '^\d+\.\d+\.\d+').Value
+          if ($fileVersion -cne $numericVersion -or $productVersion -cne $numericVersion -or $info.FileVersion -cne $version) {
+            throw "EXE 内嵌版本与 Cargo 版本 $version 不一致"
+          }
+          $asset = "WinLaunchpad_${version}_windows_x64.exe"
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $env:RUNNER_TEMP $asset)
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSET: ${{ steps.build.outputs.asset }}
+          WINLAUNCHPAD_UPDATE_PRIVATE_KEY: ${{ secrets.WINLAUNCHPAD_UPDATE_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          $assetPath = Join-Path $env:RUNNER_TEMP $env:RELEASE_ASSET
+          $signaturePath = "$assetPath.sig"
+          # 重试时沿用已发布的 EXE。签名与 EXE 的每个字节绑定，补传签名时须对该文件签署。
+          $existing = gh release view $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --json assets 2>$null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $assets = if ($releaseExists) { ($existing | ConvertFrom-Json).assets.name }
+          $hasExe = $assets -ccontains $env:RELEASE_ASSET
+          if ($hasExe -and $assets -ccontains "$env:RELEASE_ASSET.sig") { return }
+          if ($hasExe) {
+            gh release download $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --pattern $env:RELEASE_ASSET --dir $env:RUNNER_TEMP --clobber
+            if ($LASTEXITCODE -ne 0) { throw '读取已发布的 EXE 失败' }
+          }
+          node scripts/sign-update.mjs $assetPath
+          if ($LASTEXITCODE -ne 0) { throw '更新签名失败' }
+          if ($releaseExists) {
+            $upload = @($signaturePath)
+            if (-not $hasExe) { $upload = @($assetPath, $signaturePath) }
+            gh release upload $env:GITHUB_REF_NAME @upload --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            # 关于页与发布说明读取同一份内置日志。
+            $notes = Get-Content -Raw -Encoding utf8 'assets/release-notes.json' | ConvertFrom-Json
+            $note = $notes | Where-Object { "v$($_.version)" -ceq $env:GITHUB_REF_NAME } | Select-Object -First 1
+            if (-not $note) { throw "缺少 $env:GITHUB_REF_NAME 的更新日志" }
+            $lines = foreach ($section in $note.sections) {
+              "## $($section.title)"
+              ''
+              foreach ($item in $section.items) { "- $item" }
+              ''
+            }
+            $notesPath = Join-Path $env:RUNNER_TEMP 'winlaunchpad-release-notes.md'
+            $lines | Set-Content -Encoding utf8 $notesPath
+            $flags = @('--verify-tag', '--notes-file', $notesPath, '--title', "WinLaunchpad $env:GITHUB_REF_NAME")
+            if ($env:GITHUB_REF_NAME -match '^v\d+\.\d+\.\d+-') { $flags += '--prerelease' }
+            gh release create $env:GITHUB_REF_NAME $assetPath $signaturePath --repo $env:GITHUB_REPOSITORY @flags
+          }
+          if ($LASTEXITCODE -ne 0) { throw '发布 GitHub Release 失败' }
+
+  sync:
+    name: Sync GitHub Release to CNB
+    needs: [mirror, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: cnb-release-${{ github.ref_name }}
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Sync published EXE and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          RELEASE_ASSET: ${{ needs.build.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只有与当前构建提交一致的标签才能发布 CNB Release。
+          git ls-remote "$CNB_REMOTE" "$GITHUB_REF" "$GITHUB_REF^{}" \
+            | cut -f1 | grep -Fx "$(git rev-parse HEAD)"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,isPrerelease,isDraft > "$RUNNER_TEMP/release.json"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$RELEASE_ASSET" --pattern "$RELEASE_ASSET.sig" --dir "$RUNNER_TEMP" --clobber
+          node scripts/sync-cnb-release.mjs "$RUNNER_TEMP/release.json" \
+            "$RUNNER_TEMP/$RELEASE_ASSET" "$RUNNER_TEMP/$RELEASE_ASSET.sig"
