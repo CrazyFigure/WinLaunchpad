@@ -1,4 +1,4 @@
-//! 检测正式发行版，验签后将便携版交给独立替换进程。
+//! 检测正式发行版，验签后由独立进程运行 Windows 安装包。
 
 mod http;
 
@@ -13,7 +13,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PUBLIC_KEY: &str = include_str!("../assets/update-public-key.hex");
 const SIGNATURE_CONTEXT: &[u8] = b"WinLaunchpad update v1\0";
 const RELEASE_LIMIT: usize = 1024 * 1024;
-const EXE_LIMIT: usize = 16 * 1024 * 1024;
+const SETUP_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub enum Channel {
@@ -87,7 +87,7 @@ fn stable_version(value: &str) -> Option<[u64; 3]> {
 }
 
 fn asset_name(version: &str) -> String {
-    format!("WinLaunchpad_{version}_windows_x64.exe")
+    format!("WinLaunchpad_{version}_windows_x64_setup.exe")
 }
 
 fn latest_update(
@@ -103,7 +103,7 @@ fn latest_update(
             }
             let version = release.tag_name.strip_prefix('v')?;
             let parts = stable_version(version)?;
-            let exe = asset_name(version);
+            let setup = asset_name(version);
             let uploaded = |name: &str| {
                 release.assets.iter().any(|asset| {
                     asset.name == name
@@ -113,8 +113,8 @@ fn latest_update(
                             .is_none_or(|state| state == "uploaded")
                 })
             };
-            // EXE 和签名同时可下载后才显示一键更新。
-            (parts > current && uploaded(&exe) && uploaded(&format!("{exe}.sig"))).then(|| {
+            // 安装包和签名同时可下载后才显示一键更新。
+            (parts > current && uploaded(&setup) && uploaded(&format!("{setup}.sig"))).then(|| {
                 (
                     parts,
                     Release {
@@ -159,7 +159,7 @@ pub fn check() -> Result<(Option<Release>, Channel), String> {
 }
 
 /// 公钥随应用构建。签名覆盖协议前缀、完整文件名和二进制，版本与架构无法互换。
-fn verify(name: &str, exe: &[u8], signature: &[u8]) -> Result<(), String> {
+fn verify(name: &str, setup: &[u8], signature: &[u8]) -> Result<(), String> {
     let hex = PUBLIC_KEY.trim();
     let mut bytes = [0u8; 32];
     if hex.len() != 64 || !hex.is_ascii() {
@@ -171,11 +171,11 @@ fn verify(name: &str, exe: &[u8], signature: &[u8]) -> Result<(), String> {
     }
     let key = VerifyingKey::from_bytes(&bytes).map_err(|_| "内置更新公钥无效")?;
     let signature = Signature::from_slice(signature).map_err(|_| "更新签名格式错误")?;
-    let mut signed = Vec::with_capacity(SIGNATURE_CONTEXT.len() + name.len() + 1 + exe.len());
+    let mut signed = Vec::with_capacity(SIGNATURE_CONTEXT.len() + name.len() + 1 + setup.len());
     signed.extend_from_slice(SIGNATURE_CONTEXT);
     signed.extend_from_slice(name.as_bytes());
     signed.push(0);
-    signed.extend_from_slice(exe);
+    signed.extend_from_slice(setup);
     key.verify_strict(&signed, &signature)
         .map_err(|_| "更新包签名校验失败".into())
 }
@@ -185,9 +185,9 @@ pub fn download(release: &Release) -> Result<Vec<u8>, String> {
     let name = asset_name(&release.version);
     let fetch = |channel: Channel| {
         let signature = channel.download(&release.version, &format!("{name}.sig"), 64)?;
-        let exe = channel.download(&release.version, &name, EXE_LIMIT)?;
-        verify(&name, &exe, &signature)?;
-        Ok(exe)
+        let setup = channel.download(&release.version, &name, SETUP_LIMIT)?;
+        verify(&name, &setup, &signature)?;
+        Ok(setup)
     };
     fetch(release.channel).or_else(|first: String| {
         let fallback = release.channel.fallback();
@@ -201,21 +201,21 @@ pub fn download(release: &Release) -> Result<Vec<u8>, String> {
     })
 }
 
-/// 在原 EXE 同卷暂存文件。替换进程能启动后才通知设置窗口正常退出应用。
-pub fn start_replacement(exe: &[u8]) -> Result<(), String> {
+/// 将验签后的安装包暂存到程序所在卷。更新进程启动后才允许主程序退出。
+pub fn start_installation(setup: &[u8]) -> Result<(), String> {
     let target = std::env::current_exe().map_err(|err| format!("无法定位当前程序：{err}"))?;
     let parent = target.parent().ok_or("无法定位当前程序目录")?;
     let temporary = tempfile::Builder::new()
         .prefix("WinLaunchpad-update-")
         .tempdir_in(parent)
         .map_err(|err| format!("无法在程序目录准备更新：{err}"))?;
-    let script = temporary.path().join("replace.ps1");
-    fs::write(temporary.path().join("new.exe"), exe)
-        .map_err(|err| format!("写入更新 EXE 失败：{err}"))?;
+    let script = temporary.path().join("install.ps1");
+    fs::write(temporary.path().join("setup.exe"), setup)
+        .map_err(|err| format!("写入更新安装包失败：{err}"))?;
     // Windows PowerShell 5.1 通过 BOM 识别脚本中的 UTF-8 中文。
     let script_source = [
         b"\xef\xbb\xbf".as_slice(),
-        include_bytes!("update/replace.ps1"),
+        include_bytes!("update/install.ps1"),
     ]
     .concat();
     fs::write(&script, script_source).map_err(|err| format!("写入更新脚本失败：{err}"))?;
@@ -239,8 +239,8 @@ pub fn start_replacement(exe: &[u8]) -> Result<(), String> {
         .arg(&target)
         .creation_flags(CREATE_NO_WINDOW.0)
         .spawn()
-        .map_err(|err| format!("启动替换程序失败：{err}"))?;
-    // 脚本负责清理暂存文件，退出前保留它们以供替换和回滚。
+        .map_err(|err| format!("启动更新进程失败：{err}"))?;
+    // 脚本负责清理暂存文件，退出前保留安装包以供更新。
     let _ = temporary.keep();
     Ok(())
 }
@@ -264,11 +264,28 @@ mod tests {
             .map(|name| RemoteAsset { name, state: None })
             .collect(),
         };
+        // 较新的旧式便携版附件与未签名安装包都不作为更新候选。
+        let portable = RemoteRelease {
+            tag_name: "v0.0.13".into(),
+            draft: false,
+            prerelease: false,
+            assets: [
+                "WinLaunchpad_0.0.13_windows_x64.exe",
+                "WinLaunchpad_0.0.13_windows_x64.exe.sig",
+            ]
+            .into_iter()
+            .map(|name| RemoteAsset {
+                name: name.into(),
+                state: None,
+            })
+            .collect(),
+        };
         let releases = vec![
             create("v0.0.9", true, false),
             create("v0.0.11", false, false),
             create("v0.0.10", true, false),
             create("v0.0.12-beta", true, true),
+            portable,
         ];
         assert_eq!(
             latest_update(releases, Channel::Cnb, [0, 0, 1])

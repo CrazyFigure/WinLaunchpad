@@ -28,6 +28,7 @@ Windows 11 上的 macOS 风格启动台。一个快捷键呼出/收起，自动�
 4. 检测更新：打开「设置 → 关于」，点击「检测更新」。发现新版本后可一键更新并重启，展开版本行可查看更新日志。
 
 可以从 Windows「设置 → 应用 → 已安装的应用」卸载，用户配置会保留。
+已发布的 v0.0.1 便携版需要先手动运行一次新版安装包，之后可在安装版内继续一键更新。
 
 ### 配合 Quicker 使用（推荐沿用你现有的手势）
 
@@ -91,7 +92,7 @@ cargo test --release
 
 安装程序生成在 `dist`。`tools\make_icon.ps1` 可重新生成 `assets\app.ico`。
 
-发布时更新 Cargo 和 Windows 资源版本，并在 `assets/release-notes.json` 列表开头添加对应版本的日志。推送对应标签后，GitHub Actions 构建安装程序和签名更新附件，再将它们连同 Git 引用与发布说明同步到 CNB。
+发布时更新 Cargo 和 Windows 资源版本，并在 `assets/release-notes.json` 列表开头添加对应版本的日志。推送对应标签后，GitHub Actions 发布安装包及其更新签名，再将它们连同 Git 引用与发布说明同步到 CNB。
 
 ## 内置右键手势的取舍
 

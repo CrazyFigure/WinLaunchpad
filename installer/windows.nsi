@@ -48,7 +48,12 @@ Section "WinLaunchpad"
     !insertmacro RequireClosed
     SetShellVarContext current
     SetOutPath "$INSTDIR"
+    ClearErrors
     File /oname=WinLaunchpad.exe "${APP_EXE}"
+    IfErrors 0 application_written
+    SetErrorLevel 3
+    Abort "无法写入 WinLaunchpad.exe。请关闭 WinLaunchpad 后重试。"
+application_written:
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     CreateShortCut "$SMPROGRAMS\WinLaunchpad.lnk" "$INSTDIR\WinLaunchpad.exe"
 

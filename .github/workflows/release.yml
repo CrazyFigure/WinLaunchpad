@@ -51,7 +51,7 @@ jobs:
             push --prune "$CNB_REMOTE" '+refs/remotes/origin/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
 
   build:
-    name: Build and publish Windows EXE
+    name: Build and publish Windows installer
     if: >-
       github.repository == 'CrazyFigure/WinLaunchpad' &&
       ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
@@ -64,7 +64,6 @@ jobs:
       group: github-release-${{ inputs.release_tag || github.ref_name }}
       queue: max
     outputs:
-      asset: ${{ steps.build.outputs.asset }}
       setup: ${{ steps.package.outputs.setup }}
     steps:
       - uses: actions/checkout@v6
@@ -73,9 +72,11 @@ jobs:
           persist-credentials: false
 
       - name: Build and check version
-        id: build
         shell: pwsh
         run: |
+          if (-not (Test-Path -LiteralPath './tools/package-windows.ps1')) {
+            throw '此标签没有 Windows 安装脚本，无法发布安装版'
+          }
           # 发布标签须与 Cargo 包版本相同，并检查 EXE 确实内嵌了对应的 Windows 版本资源。
           $metadata = rustup run stable cargo metadata --locked --format-version 1 --no-deps
           if ($LASTEXITCODE -ne 0) { throw '读取 Cargo 包信息失败' }
@@ -93,18 +94,11 @@ jobs:
           if ($fileVersion -cne $numericVersion -or $productVersion -cne $numericVersion -or $info.FileVersion -cne $version) {
             throw "EXE 内嵌版本与 Cargo 版本 $version 不一致"
           }
-          $asset = "WinLaunchpad_${version}_windows_x64.exe"
-          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $env:RUNNER_TEMP $asset)
-          "asset=$asset" >> $env:GITHUB_OUTPUT
 
       - name: Package Windows installer
         id: package
-        env:
-          RELEASE_ASSET: ${{ steps.build.outputs.asset }}
         shell: pwsh
         run: |
-          # 老标签仍可以补发或同步它原有的附件。
-          if (-not (Test-Path -LiteralPath './tools/package-windows.ps1')) { return }
           $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
           $nsis = Join-Path $env:RUNNER_TEMP 'nsis-3.11'
           Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $archive
@@ -115,42 +109,35 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $nsis
           $compiler = Get-ChildItem -LiteralPath $nsis -Filter 'makensis.exe' -File -Recurse | Select-Object -First 1
           if (-not $compiler) { throw 'NSIS 安装包编译器不存在' }
-          $assetPath = Join-Path $env:RUNNER_TEMP $env:RELEASE_ASSET
-          $setup = & ./tools/package-windows.ps1 -Executable $assetPath -OutputDirectory $env:RUNNER_TEMP -Makensis $compiler.FullName
+          # 编译出的程序仅作为 NSIS 输入，发布附件使用安装包。
+          $exe = 'target/x86_64-pc-windows-msvc/release/winlaunchpad.exe'
+          $setup = & ./tools/package-windows.ps1 -Executable $exe -OutputDirectory $env:RUNNER_TEMP -Makensis $compiler.FullName
           "setup=$($setup.Name)" >> $env:GITHUB_OUTPUT
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ASSET: ${{ steps.build.outputs.asset }}
           SETUP_ASSET: ${{ steps.package.outputs.setup }}
           WINLAUNCHPAD_UPDATE_PRIVATE_KEY: ${{ secrets.WINLAUNCHPAD_UPDATE_PRIVATE_KEY }}
         shell: pwsh
         run: |
-          $assetPath = Join-Path $env:RUNNER_TEMP $env:RELEASE_ASSET
-          $signaturePath = "$assetPath.sig"
-          # 重试时沿用已发布的 EXE。签名与 EXE 的每个字节绑定，补传签名时须对该文件签署。
+          $setupPath = Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
+          $signaturePath = "$setupPath.sig"
+          # 重试时沿用已发布的安装包，补传签名必须签署原附件。
           $existing = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets 2>$null
           $releaseExists = $LASTEXITCODE -eq 0
           $assets = if ($releaseExists) { ($existing | ConvertFrom-Json).assets.name }
-          $hasExe = $assets -ccontains $env:RELEASE_ASSET
-          $upload = @()
-          if (-not $hasExe -or $assets -cnotcontains "$env:RELEASE_ASSET.sig") {
-            if ($hasExe) {
-              gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:RELEASE_ASSET --dir $env:RUNNER_TEMP --clobber
-              if ($LASTEXITCODE -ne 0) { throw '读取已发布的 EXE 失败' }
-            } else {
-              $upload += $assetPath
-            }
-            node scripts/sign-update.mjs $assetPath
-            if ($LASTEXITCODE -ne 0) { throw '更新签名失败' }
-            $upload += $signaturePath
+          $hasSetup = $assets -ccontains $env:SETUP_ASSET
+          if ($hasSetup -and $assets -ccontains "$env:SETUP_ASSET.sig") { return }
+          $upload = @($setupPath, $signaturePath)
+          if ($hasSetup) {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:SETUP_ASSET --dir $env:RUNNER_TEMP --clobber
+            if ($LASTEXITCODE -ne 0) { throw '读取已发布的安装包失败' }
+            $upload = @($signaturePath)
           }
-          if ($env:SETUP_ASSET -and $assets -cnotcontains $env:SETUP_ASSET) {
-            $upload += Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
-          }
+          node scripts/sign-update.mjs $setupPath
+          if ($LASTEXITCODE -ne 0) { throw '安装包签名失败' }
           if ($releaseExists) {
-            if ($upload.Count -eq 0) { return }
             gh release upload $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --clobber
           } else {
             # 关于页与发布说明读取同一份内置日志。
@@ -163,9 +150,7 @@ jobs:
               foreach ($item in $section.items) { "- $item" }
               ''
             }
-            if ($env:SETUP_ASSET) {
-              $lines = @('首次安装请下载文件名以 `_setup.exe` 结尾的安装程序。', '') + $lines
-            }
+            $lines = @('首次安装请下载文件名以 `_setup.exe` 结尾的安装程序。', '') + $lines
             $notesPath = Join-Path $env:RUNNER_TEMP 'winlaunchpad-release-notes.md'
             $lines | Set-Content -Encoding utf8 $notesPath
             $flags = @('--verify-tag', '--notes-file', $notesPath, '--title', "WinLaunchpad $env:RELEASE_TAG")
@@ -188,11 +173,10 @@ jobs:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
-      - name: Sync published Windows files
+      - name: Sync Windows installer and signature
         env:
           GH_TOKEN: ${{ github.token }}
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
-          RELEASE_ASSET: ${{ needs.build.outputs.asset }}
           SETUP_ASSET: ${{ needs.build.outputs.setup }}
         shell: bash
         run: |
@@ -203,16 +187,7 @@ jobs:
             | cut -f1 | grep -Fx "$(git rev-parse HEAD)"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,name,body,isPrerelease,isDraft > "$RUNNER_TEMP/release.json"
-          # 安装程序和旧客户端使用的签名更新附件一起同步。
-          names=("$RELEASE_ASSET" "$RELEASE_ASSET.sig")
-          if [[ -n "$SETUP_ASSET" ]]; then names+=("$SETUP_ASSET"); fi
-          patterns=()
-          paths=()
-          for name in "${names[@]}"; do
-            patterns+=(--pattern "$name")
-            paths+=("$RUNNER_TEMP/$name")
-          done
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            "${patterns[@]}" --dir "$RUNNER_TEMP" --clobber
+            --pattern "$SETUP_ASSET" --pattern "$SETUP_ASSET.sig" --dir "$RUNNER_TEMP" --clobber
           node scripts/sync-cnb-release.mjs "$RUNNER_TEMP/release.json" \
-            "${paths[@]}"
+            "$RUNNER_TEMP/$SETUP_ASSET" "$RUNNER_TEMP/$SETUP_ASSET.sig"

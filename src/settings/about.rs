@@ -134,7 +134,7 @@ impl State {
             }
             Ok(Outcome::Checked(Err(error))) => self.fail("检测失败，请检查网络后重试", &error),
             Ok(Outcome::Downloaded(result)) => {
-                match result.and_then(|exe| update::start_replacement(&exe)) {
+                match result.and_then(|setup| update::start_installation(&setup)) {
                     Ok(()) => {
                         self.status = "正在应用更新并重启".into();
                         self.restarting = true;
