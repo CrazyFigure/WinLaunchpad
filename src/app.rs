@@ -58,6 +58,7 @@ pub const WM_APP_FOCUS: u32 = WM_APP + 7;
 pub const WM_APP_WALLPAPER: u32 = WM_APP + 8;
 pub const WM_APP_UPDATE_EXIT: u32 = WM_APP + 10;
 pub const WM_APP_AUTO_UPDATE: u32 = WM_APP + 12;
+pub const WM_APP_TRAY_MENU_CLOSED: u32 = WM_APP + 13;
 
 const TIMER_FADE: usize = 1;
 const TIMER_SLIDE: usize = 2;
@@ -1383,6 +1384,10 @@ impl App {
         if self.exiting {
             return;
         }
+        if let Some(t) = &mut self.tray {
+            t.close_menu();
+        }
+        self.in_menu = false;
         unsafe {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -1946,13 +1951,25 @@ impl App {
 
     fn on_tray(&mut self, msg: u32) {
         match msg {
-            WM_LBUTTONUP => self.toggle(),
-            WM_RBUTTONUP | WM_CONTEXTMENU => {
-                self.in_menu = true;
-                if let Some(t) = &self.tray {
-                    t.show_menu(self.visible);
+            WM_LBUTTONUP => {
+                // 左键呼出/收起前先关闭可能残留的自绘托盘菜单
+                if let Some(t) = &mut self.tray {
+                    t.close_menu();
                 }
                 self.in_menu = false;
+                self.toggle();
+            }
+            WM_RBUTTONUP | WM_CONTEXTMENU => {
+                // 菜单弹出期间保持 in_menu 标记，防止主窗口失焦时误隐藏启动台
+                self.in_menu = true;
+                let opened = if let Some(t) = &mut self.tray {
+                    t.show_menu(self.visible)
+                } else {
+                    false
+                };
+                if !opened {
+                    self.in_menu = false;
+                }
             }
             _ => {}
         }
@@ -2323,6 +2340,17 @@ impl App {
             WM_APP_TRAY => {
                 let m = loword(lparam.0 as usize) as u32;
                 self.on_tray(m);
+                LRESULT(0)
+            }
+            WM_APP_TRAY_MENU_CLOSED => {
+                // 仅当销毁的窗口句柄与当前记录一致时才解除菜单阻塞标志
+                let closed_hwnd = HWND(wparam.0 as *mut _);
+                if let Some(t) = &mut self.tray {
+                    t.on_menu_closed(closed_hwnd);
+                    self.in_menu = t.is_menu_open();
+                } else {
+                    self.in_menu = false;
+                }
                 LRESULT(0)
             }
             WM_APP_SCAN => {
