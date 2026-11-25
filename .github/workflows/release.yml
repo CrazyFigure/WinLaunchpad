@@ -65,6 +65,7 @@ jobs:
       queue: max
     outputs:
       asset: ${{ steps.build.outputs.asset }}
+      setup: ${{ steps.package.outputs.setup }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -96,10 +97,33 @@ jobs:
           Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $env:RUNNER_TEMP $asset)
           "asset=$asset" >> $env:GITHUB_OUTPUT
 
+      - name: Package Windows installer
+        id: package
+        env:
+          RELEASE_ASSET: ${{ steps.build.outputs.asset }}
+        shell: pwsh
+        run: |
+          # 老标签仍可以补发或同步它原有的附件。
+          if (-not (Test-Path -LiteralPath './tools/package-windows.ps1')) { return }
+          $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+          $nsis = Join-Path $env:RUNNER_TEMP 'nsis-3.11'
+          Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $archive
+          $expected = 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expected) {
+            throw 'NSIS 下载校验失败'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $nsis
+          $compiler = Get-ChildItem -LiteralPath $nsis -Filter 'makensis.exe' -File -Recurse | Select-Object -First 1
+          if (-not $compiler) { throw 'NSIS 安装包编译器不存在' }
+          $assetPath = Join-Path $env:RUNNER_TEMP $env:RELEASE_ASSET
+          $setup = & ./tools/package-windows.ps1 -Executable $assetPath -OutputDirectory $env:RUNNER_TEMP -Makensis $compiler.FullName
+          "setup=$($setup.Name)" >> $env:GITHUB_OUTPUT
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ASSET: ${{ steps.build.outputs.asset }}
+          SETUP_ASSET: ${{ steps.package.outputs.setup }}
           WINLAUNCHPAD_UPDATE_PRIVATE_KEY: ${{ secrets.WINLAUNCHPAD_UPDATE_PRIVATE_KEY }}
         shell: pwsh
         run: |
@@ -110,16 +134,23 @@ jobs:
           $releaseExists = $LASTEXITCODE -eq 0
           $assets = if ($releaseExists) { ($existing | ConvertFrom-Json).assets.name }
           $hasExe = $assets -ccontains $env:RELEASE_ASSET
-          if ($hasExe -and $assets -ccontains "$env:RELEASE_ASSET.sig") { return }
-          if ($hasExe) {
-            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:RELEASE_ASSET --dir $env:RUNNER_TEMP --clobber
-            if ($LASTEXITCODE -ne 0) { throw '读取已发布的 EXE 失败' }
+          $upload = @()
+          if (-not $hasExe -or $assets -cnotcontains "$env:RELEASE_ASSET.sig") {
+            if ($hasExe) {
+              gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:RELEASE_ASSET --dir $env:RUNNER_TEMP --clobber
+              if ($LASTEXITCODE -ne 0) { throw '读取已发布的 EXE 失败' }
+            } else {
+              $upload += $assetPath
+            }
+            node scripts/sign-update.mjs $assetPath
+            if ($LASTEXITCODE -ne 0) { throw '更新签名失败' }
+            $upload += $signaturePath
           }
-          node scripts/sign-update.mjs $assetPath
-          if ($LASTEXITCODE -ne 0) { throw '更新签名失败' }
+          if ($env:SETUP_ASSET -and $assets -cnotcontains $env:SETUP_ASSET) {
+            $upload += Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
+          }
           if ($releaseExists) {
-            $upload = @($signaturePath)
-            if (-not $hasExe) { $upload = @($assetPath, $signaturePath) }
+            if ($upload.Count -eq 0) { return }
             gh release upload $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --clobber
           } else {
             # 关于页与发布说明读取同一份内置日志。
@@ -132,11 +163,14 @@ jobs:
               foreach ($item in $section.items) { "- $item" }
               ''
             }
+            if ($env:SETUP_ASSET) {
+              $lines = @('首次安装请下载文件名以 `_setup.exe` 结尾的安装程序。', '') + $lines
+            }
             $notesPath = Join-Path $env:RUNNER_TEMP 'winlaunchpad-release-notes.md'
             $lines | Set-Content -Encoding utf8 $notesPath
             $flags = @('--verify-tag', '--notes-file', $notesPath, '--title', "WinLaunchpad $env:RELEASE_TAG")
             if ($env:RELEASE_TAG -match '^v\d+\.\d+\.\d+-') { $flags += '--prerelease' }
-            gh release create $env:RELEASE_TAG $assetPath $signaturePath --repo $env:GITHUB_REPOSITORY @flags
+            gh release create $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY @flags
           }
           if ($LASTEXITCODE -ne 0) { throw '发布 GitHub Release 失败' }
 
@@ -154,11 +188,12 @@ jobs:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
-      - name: Sync published EXE and signature
+      - name: Sync published Windows files
         env:
           GH_TOKEN: ${{ github.token }}
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           RELEASE_ASSET: ${{ needs.build.outputs.asset }}
+          SETUP_ASSET: ${{ needs.build.outputs.setup }}
         shell: bash
         run: |
           set -euo pipefail
@@ -168,7 +203,16 @@ jobs:
             | cut -f1 | grep -Fx "$(git rev-parse HEAD)"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,name,body,isPrerelease,isDraft > "$RUNNER_TEMP/release.json"
+          # 安装程序和旧客户端使用的签名更新附件一起同步。
+          names=("$RELEASE_ASSET" "$RELEASE_ASSET.sig")
+          if [[ -n "$SETUP_ASSET" ]]; then names+=("$SETUP_ASSET"); fi
+          patterns=()
+          paths=()
+          for name in "${names[@]}"; do
+            patterns+=(--pattern "$name")
+            paths+=("$RUNNER_TEMP/$name")
+          done
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "$RELEASE_ASSET" --pattern "$RELEASE_ASSET.sig" --dir "$RUNNER_TEMP" --clobber
+            "${patterns[@]}" --dir "$RUNNER_TEMP" --clobber
           node scripts/sync-cnb-release.mjs "$RUNNER_TEMP/release.json" \
-            "$RUNNER_TEMP/$RELEASE_ASSET" "$RUNNER_TEMP/$RELEASE_ASSET.sig"
+            "${paths[@]}"

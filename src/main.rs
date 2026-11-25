@@ -10,6 +10,9 @@
 //!   WinLaunchpad.exe --worker-icons   短时子进程：批量提取应用图标
 //!   WinLaunchpad.exe --worker-wallpaper 短时子进程：生成壁纸毛玻璃缓存
 
+// 从资源管理器、快捷方式或安装程序启动时，不分配控制台窗口。
+#![windows_subsystem = "windows"]
+
 mod add;
 mod app;
 mod catalog;
@@ -72,6 +75,17 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+    // 安装程序只维护现有启动项。这两个内部命令不启动主窗口或单实例服务。
+    if args.len() == 1 {
+        let result = match args[0].as_str() {
+            "--installer-refresh-startup" => Some(startup::refresh_existing_shortcut()),
+            "--installer-remove-startup" => Some(startup::remove_current_shortcut()),
+            _ => None,
+        };
+        if let Some(result) = result {
+            std::process::exit(i32::from(result.is_err()));
+        }
     }
     let background = args.iter().any(|a| a == "--background");
     let settings = args.iter().any(|a| a == "--settings");

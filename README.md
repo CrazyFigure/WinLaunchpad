@@ -22,10 +22,12 @@ Windows 11 上的 macOS 风格启动台。一个快捷键呼出/收起，自动�
 
 ## 快速开始
 
-1. 运行 `WinLaunchpad.exe`。首次启动会在后台扫描应用（约 1 秒），并在托盘出现图标。
+1. 从 Release 下载 `WinLaunchpad_<版本>_windows_x64_setup.exe`，双击打开安装向导。默认安装到当前用户的 `%LOCALAPPDATA%\Programs\WinLaunchpad`，完成后可从开始菜单打开。
 2. 按 `Ctrl + Alt + Shift + A` 呼出 / 收起；输入几个字母即可搜索；`Esc` 或点击其它位置收起。
 3. 想改快捷键：托盘右键 →「设置…」→「修改…」→ 按下新组合键 → 确定。
 4. 检测更新：打开「设置 → 关于」，点击「检测更新」。发现新版本后可一键更新并重启，展开版本行可查看更新日志。
+
+可以从 Windows「设置 → 应用 → 已安装的应用」卸载，用户配置会保留。
 
 ### 配合 Quicker 使用（推荐沿用你现有的手势）
 
@@ -81,9 +83,15 @@ cargo build --release
 cargo test --release
 ```
 
-产物 `target\release\winlaunchpad.exe` 为 Windows 便携版。`tools\make_icon.ps1` 可重新生成 `assets\app.ico`。
+使用 NSIS 3.11 打包安装程序，`makensis.exe` 需在 PATH 上，也可以通过 `-Makensis` 指定路径。
 
-发布时更新 Cargo 和 Windows 资源版本，并在 `assets/release-notes.json` 列表开头添加对应版本的日志。推送对应标签后，GitHub Actions 构建并签名 EXE，再将 Git 引用、发布说明、EXE 和签名附件同步到 CNB。
+```powershell
+./tools/package-windows.ps1 -Executable ./target/release/winlaunchpad.exe
+```
+
+安装程序生成在 `dist`。`tools\make_icon.ps1` 可重新生成 `assets\app.ico`。
+
+发布时更新 Cargo 和 Windows 资源版本，并在 `assets/release-notes.json` 列表开头添加对应版本的日志。推送对应标签后，GitHub Actions 构建安装程序和签名更新附件，再将它们连同 Git 引用与发布说明同步到 CNB。
 
 ## 内置右键手势的取舍
 

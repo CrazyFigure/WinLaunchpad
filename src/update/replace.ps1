@@ -23,6 +23,14 @@ try {
     $Replaced = $true
     Start-WinLaunchpad
     $Replaced = $false
+
+    # 安装版仍通过已有的验签流程替换 EXE，仅刷新属于此目录的卸载记录。
+    $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinLaunchpad'
+    $Installation = Get-ItemProperty -LiteralPath $UninstallKey -ErrorAction SilentlyContinue
+    if ($Installation.InstallLocation -ieq [System.IO.Path]::GetDirectoryName($TargetExe)) {
+        $Version = (Get-Item -LiteralPath $TargetExe -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+        if ($Version) { Set-ItemProperty -LiteralPath $UninstallKey -Name 'DisplayVersion' -Value $Version -ErrorAction SilentlyContinue }
+    }
 } catch {
     $Failure = $_.Exception.Message
     if ($Replaced) {
