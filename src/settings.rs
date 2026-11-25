@@ -27,8 +27,8 @@ use crate::icons::IconWorker;
 use crate::startup;
 use crate::ui::{
     draw_button, draw_checkbox, draw_gesture_glyph, draw_scrollbar, draw_text,
-    draw_toggle, draw_tooltip, make_font, rgb, BtnStyle, CheckState, DibTarget, GestureGlyph,
-    Surface, TextAlign,
+    draw_toggle, draw_tooltip, make_font, measure_text, rgb, BtnStyle, CheckState, DibTarget,
+    GestureGlyph, Surface, TextAlign,
 };
 use crate::win32::*;
 
@@ -418,10 +418,11 @@ impl Dlg {
         let gesture_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row1.top + (s(52.0) - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row1.top + (s(52.0) + th) / 2 };
         let gesture_swap_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row2.top + (s(52.0) - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row2.top + (s(52.0) + th) / 2 };
 
-        let g_top = gesture_card.bottom + s(16.0);
+        // 预留卡片底部只读快捷键徽标高度，并保持上下卡片间距均衡
+        let g_top = gesture_card.bottom + s(14.0);
         let g_gap = s(12.0);
         let card_w3 = (cw - g_gap * 2) / 3;
-        let card_h = s(126.0);
+        let card_h = s(144.0);
         let g0 = RECT { left: content.left, top: g_top, right: content.left + card_w3, bottom: g_top + card_h };
         let g1 = RECT { left: g0.right + g_gap, top: g_top, right: g0.right + g_gap + card_w3, bottom: g_top + card_h };
         let g2 = RECT { left: g1.right + g_gap, top: g_top, right: content.right, bottom: g_top + card_h };
@@ -1256,15 +1257,8 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
             }
         }
         Hit::GestureCard(idx) => {
-            let swap = app.settings.gesture_swap_lr;
-            let text = match idx {
-                0 => if swap { "按住右键向左划：Ctrl + Win + ←" } else { "按住右键向左划：Ctrl + Win + →" },
-                1 => if swap { "按住右键向右划：Ctrl + Win + →" } else { "按住右键向右划：Ctrl + Win + ←" },
-                2 => "按住右键向上划：Ctrl + Alt + Tab（切换窗口）",
-                3 => "按住右键先右上再右下：打开或收起启动台（支持 Quicker --toggle）",
-                _ => "按住右键先右下再右上：Win + Tab（任务视图）",
-            };
-            Some((Hit::GestureCard(idx), l.gesture_cards[idx], text.into()))
+            let specs = gesture_card_specs(app.settings.gesture_swap_lr, &app.hotkey.display());
+            specs.get(idx).map(|spec| (Hit::GestureCard(idx), l.gesture_cards[idx], spec.tip.clone()))
         }
         _ => None,
     };
@@ -1821,6 +1815,59 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     }
 }
 
+struct GestureCardSpec {
+    glyph: GestureGlyph,
+    name: &'static str,
+    action: &'static str,
+    shortcut: String,
+    tip: String,
+}
+
+/// 生成五张手势说明卡的展示数据（与左右方向反转设置及全局快捷键保持同步）。
+fn gesture_card_specs(swap: bool, launchpad_hotkey: &str) -> [GestureCardSpec; 5] {
+    let left_sc = if swap { "Ctrl + Win + ←" } else { "Ctrl + Win + →" };
+    let right_sc = if swap { "Ctrl + Win + →" } else { "Ctrl + Win + ←" };
+    [
+        GestureCardSpec {
+            glyph: GestureGlyph::Left,
+            name: "向左划",
+            action: if swap { "切换桌面 · 向左" } else { "切换桌面 · 向右" },
+            shortcut: left_sc.into(),
+            tip: format!("按住右键向左划：{left_sc}"),
+        },
+        GestureCardSpec {
+            glyph: GestureGlyph::Right,
+            name: "向右划",
+            action: if swap { "切换桌面 · 向右" } else { "切换桌面 · 向左" },
+            shortcut: right_sc.into(),
+            tip: format!("按住右键向右划：{right_sc}"),
+        },
+        GestureCardSpec {
+            glyph: GestureGlyph::Up,
+            name: "向上划",
+            action: "切换窗口",
+            shortcut: "Ctrl + Alt + Tab".into(),
+            tip: "按住右键向上划：Ctrl + Alt + Tab（切换窗口）".into(),
+        },
+        GestureCardSpec {
+            glyph: GestureGlyph::UpDown,
+            name: "∧ 轨迹",
+            action: "打开 / 收起启动台",
+            shortcut: launchpad_hotkey.into(),
+            tip: format!(
+                "按住右键先右上再右下：打开或收起启动台（快捷键 {launchpad_hotkey}，支持 Quicker --toggle）"
+            ),
+        },
+        GestureCardSpec {
+            glyph: GestureGlyph::DownUp,
+            name: "∨ 轨迹",
+            action: "全部窗口（任务视图）",
+            shortcut: "Win + Tab".into(),
+            tip: "按住右键先右下再右上：Win + Tab（任务视图）".into(),
+        },
+    ]
+}
+
 fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: windows::Win32::Graphics::Gdi::HDC, s: f32) {
     sf.fill_rrect(&l.gesture_card, 10.0 * s, rgb(0xF8FAFC, 1.0));
     sf.stroke_rrect(&l.gesture_card, 10.0 * s, 1.0, rgb(0xE2E8F0, 1.0));
@@ -1839,26 +1886,52 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
     draw_toggle(sf, &l.gesture_toggle, app.settings.gestures_enabled, dlg.hover == Hit::ToggleGesture, dlg.pressed == Hit::ToggleGesture, s);
     draw_toggle(sf, &l.gesture_swap_toggle, app.settings.gesture_swap_lr, dlg.hover == Hit::ToggleGestureSwap, dlg.pressed == Hit::ToggleGestureSwap, s);
 
-    let swap = app.settings.gesture_swap_lr;
-    let specs = [
-        (GestureGlyph::Left, "向左划", if swap { "切换桌面 · 向左" } else { "切换桌面 · 向右" }),
-        (GestureGlyph::Right, "向右划", if swap { "切换桌面 · 向右" } else { "切换桌面 · 向左" }),
-        (GestureGlyph::Up, "向上划", "切换窗口"),
-        (GestureGlyph::UpDown, "∧ 轨迹", "打开 / 收起启动台"),
-        (GestureGlyph::DownUp, "∨ 轨迹", "全部窗口（任务视图）"),
-    ];
-    for (i, (glyph, name, action)) in specs.iter().enumerate() {
+    let specs = gesture_card_specs(app.settings.gesture_swap_lr, &app.hotkey.display());
+    for (i, spec) in specs.iter().enumerate() {
         let cr = &l.gesture_cards[i];
         let hov = dlg.hover == Hit::GestureCard(i);
         sf.fill_rrect(cr, 10.0 * s, if hov { rgb(0xF8FAFC, 1.0) } else { rgb(0xFFFFFF, 1.0) });
         sf.stroke_rrect(cr, 10.0 * s, (1.1 * s).max(1.0), if hov { rgb(0x93C5FD, 1.0) } else { rgb(0xE2E8F0, 1.0) });
         let gcx = (cr.left + cr.right) as f32 * 0.5;
-        let gcy = cr.top as f32 + 44.0 * s;
-        draw_gesture_glyph(sf, gcx, gcy, 46.0 * s, *glyph, s);
-        let nr = RECT { left: cr.left + (8.0 * s) as i32, top: cr.top + (74.0 * s) as i32, right: cr.right - (8.0 * s) as i32, bottom: cr.top + (96.0 * s) as i32 };
-        let ar = RECT { left: cr.left + (8.0 * s) as i32, top: cr.top + (96.0 * s) as i32, right: cr.right - (8.0 * s) as i32, bottom: cr.bottom - (8.0 * s) as i32 };
-        draw_text(dc, name, dlg.font_section, &nr, rgb(0x111827, 1.0), TextAlign::Center, true, false);
-        draw_text(dc, action, dlg.font_sub, &ar, rgb(0x64748B, 1.0), TextAlign::Center, true, false);
+        let gcy = cr.top as f32 + 37.0 * s;
+        draw_gesture_glyph(sf, gcx, gcy, 44.0 * s, spec.glyph, s);
+        let nr = RECT {
+            left: cr.left + (8.0 * s).round() as i32,
+            top: cr.top + (63.0 * s).round() as i32,
+            right: cr.right - (8.0 * s).round() as i32,
+            bottom: cr.top + (85.0 * s).round() as i32,
+        };
+        let ar = RECT {
+            left: cr.left + (8.0 * s).round() as i32,
+            top: cr.top + (84.0 * s).round() as i32,
+            right: cr.right - (8.0 * s).round() as i32,
+            bottom: cr.top + (103.0 * s).round() as i32,
+        };
+        draw_text(dc, spec.name, dlg.font_section, &nr, rgb(0x111827, 1.0), TextAlign::Center, true, false);
+        draw_text(dc, spec.action, dlg.font_sub, &ar, rgb(0x64748B, 1.0), TextAlign::Center, true, false);
+
+        // 只读快捷键徽标：采用浅灰底微描边胶囊样式，仅作按键说明展示，不可点击或修改
+        let (sc_w, _) = measure_text(dc, &spec.shortcut, dlg.font_sub);
+        let card_w = cr.right - cr.left;
+        let pill_w = (sc_w + (18.0 * s).round() as i32)
+            .clamp((72.0 * s).round() as i32, (card_w - (20.0 * s).round() as i32).max(1));
+        let pill_cx = (cr.left + cr.right) / 2;
+        let pill_rc = RECT {
+            left: pill_cx - pill_w / 2,
+            top: cr.top + (109.0 * s).round() as i32,
+            right: pill_cx + (pill_w - pill_w / 2),
+            bottom: cr.bottom - (12.0 * s).round() as i32,
+        };
+        let pill_tc = if hov { rgb(0x334155, 1.0) } else { rgb(0x475569, 1.0) };
+        sf.fill_rrect(&pill_rc, 6.0 * s, rgb(0xF1F5F9, 1.0));
+        sf.stroke_rrect(&pill_rc, 6.0 * s, (1.0 * s).max(1.0), rgb(0xE2E8F0, 1.0));
+        let pill_text_rc = RECT {
+            left: pill_rc.left + (6.0 * s).round() as i32,
+            top: pill_rc.top,
+            right: pill_rc.right - (6.0 * s).round() as i32,
+            bottom: pill_rc.bottom,
+        };
+        draw_text(dc, &spec.shortcut, dlg.font_sub, &pill_text_rc, pill_tc, TextAlign::Center, true, true);
     }
 }
 
@@ -2446,5 +2519,47 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gesture_card_specs_reflect_swap_and_hotkey() {
+        let normal = gesture_card_specs(false, "Ctrl + Alt + Shift + A");
+        assert_eq!(normal[0].action, "切换桌面 · 向右");
+        assert_eq!(normal[0].shortcut, "Ctrl + Win + →");
+        assert_eq!(normal[1].action, "切换桌面 · 向左");
+        assert_eq!(normal[1].shortcut, "Ctrl + Win + ←");
+        assert_eq!(normal[2].shortcut, "Ctrl + Alt + Tab");
+        assert_eq!(normal[3].shortcut, "Ctrl + Alt + Shift + A");
+        assert_eq!(normal[4].shortcut, "Win + Tab");
+
+        let swapped = gesture_card_specs(true, "Alt + Space");
+        assert_eq!(swapped[0].action, "切换桌面 · 向左");
+        assert_eq!(swapped[0].shortcut, "Ctrl + Win + ←");
+        assert_eq!(swapped[1].action, "切换桌面 · 向右");
+        assert_eq!(swapped[1].shortcut, "Ctrl + Win + →");
+        assert_eq!(swapped[3].shortcut, "Alt + Space");
+    }
+
+    #[test]
+    fn gesture_shortcut_text_fits_card_width() {
+        let mut target = DibTarget::default();
+        assert!(target.ensure(240, 160));
+        let dc = target.mem_dc.expect("测试 DIB DC 应已创建");
+        let font = make_font(12, 400);
+        let specs = gesture_card_specs(false, "Ctrl + Alt + Shift + A");
+        // 标准窗口宽度下每张手势卡宽约 193px，预留左右内边距后快捷键文案应完整容纳
+        for spec in &specs {
+            let (tw, _) = measure_text(dc, &spec.shortcut, font);
+            assert!(tw > 0 && tw + 18 <= 173, "快捷键过宽: {} ({tw}px)", spec.shortcut);
+        }
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        target.release();
     }
 }
