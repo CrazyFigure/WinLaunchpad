@@ -40,6 +40,28 @@ fn default_roundness() -> u8 {
     1
 }
 
+/// 默认手势识别最低匹配度百分比（70%）。
+pub const DEFAULT_GESTURE_THRESHOLD: u8 = 70;
+/// 手势识别匹配度下限（50%）。
+pub const MIN_GESTURE_THRESHOLD: u8 = 50;
+/// 手势识别匹配度上限（95%）。
+pub const MAX_GESTURE_THRESHOLD: u8 = 95;
+/// 设置面板步进调节步长（5%）。
+pub const GESTURE_THRESHOLD_STEP: u8 = 5;
+
+fn default_gesture_threshold() -> u8 {
+    DEFAULT_GESTURE_THRESHOLD
+}
+
+/// 将手势匹配度百分比限制在有效范围（50..=95），0 视为旧配置缺省并回落到默认值 70。
+pub fn clamp_gesture_threshold(pct: u8) -> u8 {
+    if pct == 0 {
+        DEFAULT_GESTURE_THRESHOLD
+    } else {
+        pct.clamp(MIN_GESTURE_THRESHOLD, MAX_GESTURE_THRESHOLD)
+    }
+}
+
 fn default_scan_interval_secs() -> u32 {
     30
 }
@@ -95,6 +117,9 @@ pub struct Settings {
     /// 左右手势切桌面方向反转
     #[serde(default)]
     pub gesture_swap_lr: bool,
+    /// 手势识别最低匹配度百分比（50..=95，默认 70）
+    #[serde(default = "default_gesture_threshold")]
+    pub gesture_threshold: u8,
     /// 启动台使用桌面壁纸毛玻璃背景
     #[serde(default = "default_true")]
     pub use_wallpaper_blur: bool,
@@ -144,6 +169,7 @@ impl Default for Settings {
             start_with_windows: true,
             gestures_enabled: false,
             gesture_swap_lr: false,
+            gesture_threshold: DEFAULT_GESTURE_THRESHOLD,
             use_wallpaper_blur: true,
             icon_size_dp: default_icon_size(),
             icon_roundness: default_roundness(),
@@ -231,6 +257,7 @@ impl Store {
         s.grid_cols = if s.grid_cols <= 0 { 0 } else { s.grid_cols.clamp(4, 10) };
         s.grid_rows = if s.grid_rows <= 0 { 0 } else { s.grid_rows.clamp(3, 8) };
         s.scan_interval_secs = snap_scan_interval_secs(s.scan_interval_secs);
+        s.gesture_threshold = clamp_gesture_threshold(s.gesture_threshold);
         s
     }
 
@@ -301,5 +328,15 @@ mod tests {
         assert!(s.event_watch_enabled);
         assert!(!s.scan_on_show);
         assert!(s.refresh_changed_icons);
+        assert_eq!(s.gesture_threshold, 70);
+    }
+
+    #[test]
+    fn gesture_threshold_clamps_within_valid_range() {
+        assert_eq!(clamp_gesture_threshold(0), 70);
+        assert_eq!(clamp_gesture_threshold(10), 50);
+        assert_eq!(clamp_gesture_threshold(70), 70);
+        assert_eq!(clamp_gesture_threshold(85), 85);
+        assert_eq!(clamp_gesture_threshold(100), 95);
     }
 }

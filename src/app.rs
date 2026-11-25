@@ -638,6 +638,7 @@ impl App {
         tray.add();
         self.tray = Some(tray);
         self.icons = Some(IconWorker::start(self.hwnd, self.store.icons_dir()));
+        gesture::set_threshold(self.settings.gesture_threshold);
         self.gesture = gesture::start(self.hwnd);
         if self.settings.gestures_enabled {
             if let Some(g) = &self.gesture {
@@ -1837,6 +1838,13 @@ impl App {
         } else if enabled {
             log::log("手势线程不可用，无法启用手势");
         }
+    }
+
+    /// 实时更新手势识别最低匹配度百分比并同步到底层钩子线程。
+    pub fn apply_gesture_threshold(&mut self, pct: u8) {
+        let clamped = crate::config::clamp_gesture_threshold(pct);
+        self.settings.gesture_threshold = clamped;
+        gesture::set_threshold(clamped);
     }
 
     /// 供非提权自有窗口在鼠标移动时触发低级手势钩子自愈检测。

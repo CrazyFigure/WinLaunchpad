@@ -2,7 +2,7 @@
 //! 回调内仅做轻量采样、状态裁决与非阻塞派发，绝不在钩子内同步调用 SendInput；
 //! 普通右键回放与快捷键动作由独立发送线程异步执行，避免触发系统低级钩子超时失效。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -98,9 +98,18 @@ pub struct TrailSnapshot {
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
+static GESTURE_THRESHOLD_PCT: AtomicU8 = AtomicU8::new(crate::config::DEFAULT_GESTURE_THRESHOLD);
 static LAST_HOOK_TICK: AtomicU64 = AtomicU64::new(0);
 static LAST_REINSTALL_TICK: AtomicU64 = AtomicU64::new(0);
 static TRAIL_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// 实时更新全局手势识别的最低匹配度百分比（原子写入，无需重装鼠标钩子）。
+pub fn set_threshold(pct: u8) {
+    GESTURE_THRESHOLD_PCT.store(
+        crate::config::clamp_gesture_threshold(pct),
+        Ordering::Relaxed,
+    );
+}
 
 static TRAIL_SNAPSHOT: Mutex<TrailSnapshot> = Mutex::new(TrailSnapshot {
     active: false,
@@ -146,6 +155,7 @@ pub fn take_trail_snapshot() -> TrailSnapshot {
 struct State {
     tracking: bool,
     moved: bool,
+    dpi_scale: f32,
     start: POINT,
     last: POINT,
     last_trail: POINT,
@@ -156,6 +166,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     tracking: false,
     moved: false,
+    dpi_scale: 1.0,
     start: POINT { x: 0, y: 0 },
     last: POINT { x: 0, y: 0 },
     last_trail: POINT { x: 0, y: 0 },
@@ -310,6 +321,7 @@ fn reset_state() {
     if let Ok(mut st) = STATE.lock() {
         st.tracking = false;
         st.moved = false;
+        st.dpi_scale = 1.0;
         st.pts.clear();
         st.trail.clear();
     }
@@ -321,78 +333,257 @@ fn reset_state() {
     TRAIL_DIRTY.store(false, Ordering::Release);
 }
 
-/// 基于几何拐点与弦长比识别五种预设手势，容忍人手划动的轻微弧度与斜角。
-pub fn recognize_pts(pts: &[POINT]) -> Option<Gesture> {
-    if pts.len() < 2 {
+/// 手势识别重采样分段数（32 段切线 + 33 个等弧长采样点）。
+const N_STEPS: usize = 32;
+const N_PTS: usize = N_STEPS + 1;
+/// 切线 DTW 的 Sakoe-Chiba 带状窗口半径，允许折线双段长度适度不对称（±12.5%）。
+const DTW_BAND: usize = 4;
+/// 非对角规整步附加惩罚，避免过度拉伸短折返段蒙混过关。
+const DTW_WARP_PENALTY: f32 = 0.04;
+
+/// 预计算的手势模板（包含 Protractor 单位空间点云与单位切线序列）。
+struct GestureTemplate {
+    gesture: Gesture,
+    is_chevron: bool,
+    norm_pts: [(f32, f32); N_PTS],
+    tangents: [(f32, f32); N_STEPS],
+}
+
+static TEMPLATES: OnceLock<Vec<GestureTemplate>> = OnceLock::new();
+
+/// 对任意点序列执行等弧长重采样，返回 33 个采样点、总弧长与包络跨度。
+fn resample_with<F>(len: usize, get: F) -> Option<([(f32, f32); N_PTS], f32, f32, f32)>
+where
+    F: Fn(usize) -> (f32, f32),
+{
+    if len < 2 {
         return None;
     }
-    let start = pts[0];
-    let end = *pts.last().unwrap();
-
-    let mut path_len = 0.0f32;
-    let (mut min_y_idx, mut min_y) = (0usize, start.y);
-    let (mut max_y_idx, mut max_y) = (0usize, start.y);
-    for (i, p) in pts.iter().enumerate() {
-        if i > 0 {
-            let prev = pts[i - 1];
-            path_len += (((p.x - prev.x) as f32).powi(2) + ((p.y - prev.y) as f32).powi(2)).sqrt();
-        }
-        if p.y < min_y {
-            min_y = p.y;
-            min_y_idx = i;
-        }
-        if p.y > max_y {
-            max_y = p.y;
-            max_y_idx = i;
-        }
+    let first = get(0);
+    let last = get(len - 1);
+    let mut total = 0.0f32;
+    let (mut min_x, mut max_x) = (first.0, first.0);
+    let (mut min_y, mut max_y) = (first.1, first.1);
+    let mut prev = first;
+    for i in 1..len {
+        let p = get(i);
+        total += (p.0 - prev.0).hypot(p.1 - prev.1);
+        min_x = min_x.min(p.0);
+        max_x = max_x.max(p.0);
+        min_y = min_y.min(p.1);
+        max_y = max_y.max(p.1);
+        prev = p;
     }
-
-    if path_len < 36.0 {
+    if total <= 1e-3 {
         return None;
     }
 
-    let dx = (end.x - start.x) as f32;
-    let dy = (end.y - start.y) as f32;
-    let chord = (dx * dx + dy * dy).sqrt();
+    let mut out = [(0.0f32, 0.0f32); N_PTS];
+    out[0] = first;
+    out[N_STEPS] = last;
 
-    // 1. 折线手势 ∧（先明显向上、再明显向下）
-    let up_rise = (start.y - min_y) as f32;
-    let down_fall = (end.y - min_y) as f32;
-    if up_rise >= 26.0
-        && down_fall >= 26.0
-        && min_y_idx > 0
-        && min_y_idx + 1 < pts.len()
-        && path_len <= (up_rise + down_fall + dx.abs()) * 1.75
-    {
-        return Some(Gesture::UpDown);
-    }
-
-    // 2. 折线手势 ∨（先明显向下、再明显向上）
-    let down_drop = (max_y - start.y) as f32;
-    let up_climb = (max_y - end.y) as f32;
-    if down_drop >= 26.0
-        && up_climb >= 26.0
-        && max_y_idx > 0
-        && max_y_idx + 1 < pts.len()
-        && path_len <= (down_drop + up_climb + dx.abs()) * 1.75
-    {
-        return Some(Gesture::DownUp);
-    }
-
-    // 3. 直线单向手势（弦长占总路径 >= 72%，避免把圈/折线误判为直线）
-    if chord >= 36.0 && (chord / path_len) >= 0.72 {
-        if dx < 0.0 && dx.abs() > dy.abs() * 1.3 {
-            return Some(Gesture::Left);
+    let step = total / N_STEPS as f32;
+    let mut acc = 0.0f32;
+    let mut seg_idx = 0usize;
+    for k in 1..N_STEPS {
+        let target = k as f32 * step;
+        while seg_idx + 1 < len {
+            let p0 = get(seg_idx);
+            let p1 = get(seg_idx + 1);
+            let seg_len = (p1.0 - p0.0).hypot(p1.1 - p0.1);
+            if seg_len > 1e-6 && acc + seg_len >= target {
+                let t = ((target - acc) / seg_len).clamp(0.0, 1.0);
+                out[k] = (p0.0 + (p1.0 - p0.0) * t, p0.1 + (p1.1 - p0.1) * t);
+                break;
+            }
+            acc += seg_len;
+            seg_idx += 1;
         }
-        if dx > 0.0 && dx.abs() > dy.abs() * 1.3 {
-            return Some(Gesture::Right);
-        }
-        if dy < 0.0 && dy.abs() > dx.abs() * 1.3 {
-            return Some(Gesture::Up);
+        if seg_idx + 1 >= len {
+            out[k] = out[N_STEPS];
         }
     }
+    Some((out, total, max_x - min_x, max_y - min_y))
+}
 
-    None
+/// 将采样点中心化并等比例缩放到单位均方根半径（保留原始长宽比，避免直线噪声被非均匀拉伸）。
+fn normalize_rms(pts: &[(f32, f32); N_PTS]) -> [(f32, f32); N_PTS] {
+    let n = N_PTS as f32;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for &(x, y) in pts {
+        cx += x;
+        cy += y;
+    }
+    cx /= n;
+    cy /= n;
+
+    let mut centered = [(0.0f32, 0.0f32); N_PTS];
+    let mut sum_sq = 0.0f32;
+    for i in 0..N_PTS {
+        let dx = pts[i].0 - cx;
+        let dy = pts[i].1 - cy;
+        centered[i] = (dx, dy);
+        sum_sq += dx * dx + dy * dy;
+    }
+    let rms = (sum_sq / n).sqrt();
+    if rms > 1e-6 {
+        for p in &mut centered {
+            p.0 /= rms;
+            p.1 /= rms;
+        }
+    }
+    centered
+}
+
+/// 由等弧长采样点提取 32 段单位方向切线向量。
+fn compute_tangents(pts: &[(f32, f32); N_PTS]) -> [(f32, f32); N_STEPS] {
+    let mut ts = [(0.0f32, 0.0f32); N_STEPS];
+    for i in 0..N_STEPS {
+        let dx = pts[i + 1].0 - pts[i].0;
+        let dy = pts[i + 1].1 - pts[i].1;
+        let d = dx.hypot(dy);
+        if d > 1e-6 {
+            ts[i] = (dx / d, dy / d);
+        }
+    }
+    ts
+}
+
+/// 构建多纵横比预置手势模板库（单向直线各 1 个，∧ / ∨ 折线各含窄、标准、宽 3 种常见书写比例）。
+fn build_template(gesture: Gesture, is_chevron: bool, raw: &[(f32, f32)]) -> GestureTemplate {
+    let (resampled, _, _, _) = resample_with(raw.len(), |i| raw[i]).expect("手势模板点数有效");
+    GestureTemplate {
+        gesture,
+        is_chevron,
+        norm_pts: normalize_rms(&resampled),
+        tangents: compute_tangents(&resampled),
+    }
+}
+
+fn templates() -> &'static [GestureTemplate] {
+    TEMPLATES.get_or_init(|| {
+        vec![
+            build_template(Gesture::Left, false, &[(100.0, 0.0), (0.0, 0.0)]),
+            build_template(Gesture::Right, false, &[(0.0, 0.0), (100.0, 0.0)]),
+            build_template(Gesture::Up, false, &[(0.0, 100.0), (0.0, 0.0)]),
+            build_template(Gesture::UpDown, true, &[(0.0, 100.0), (25.0, 0.0), (50.0, 100.0)]),
+            build_template(Gesture::UpDown, true, &[(0.0, 80.0), (50.0, 0.0), (100.0, 80.0)]),
+            build_template(Gesture::UpDown, true, &[(0.0, 55.0), (80.0, 0.0), (160.0, 55.0)]),
+            build_template(Gesture::DownUp, true, &[(0.0, 0.0), (25.0, 100.0), (50.0, 0.0)]),
+            build_template(Gesture::DownUp, true, &[(0.0, 0.0), (50.0, 80.0), (100.0, 0.0)]),
+            build_template(Gesture::DownUp, true, &[(0.0, 0.0), (80.0, 55.0), (160.0, 0.0)]),
+        ]
+    })
+}
+
+/// Protractor 方向敏感空间余弦相似度（90° 正交归零，保留几何对称性与整体落点分布）。
+fn protractor_score(a: &[(f32, f32); N_PTS], b: &[(f32, f32); N_PTS]) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..N_PTS {
+        dot += a[i].0 * b[i].0 + a[i].1 * b[i].1;
+    }
+    let rho = (dot / N_PTS as f32).clamp(-1.0, 1.0);
+    let ang = rho.acos();
+    (1.0 - ang / std::f32::consts::FRAC_PI_2).max(0.0)
+}
+
+/// Sakoe-Chiba 带状约束的切线方向动态时间规整相似度（栈上 1D DP，无堆分配）。
+fn dtw_tangent_score(ta: &[(f32, f32); N_STEPS], tb: &[(f32, f32); N_STEPS]) -> f32 {
+    const INF: f32 = 1.0e9;
+    let mut prev = [INF; N_PTS];
+    prev[0] = 0.0;
+    for i in 1..=N_STEPS {
+        let mut curr = [INF; N_PTS];
+        let j0 = i.saturating_sub(DTW_BAND).max(1);
+        let j1 = (i + DTW_BAND).min(N_STEPS);
+        let (tx, ty) = ta[i - 1];
+        for j in j0..=j1 {
+            let (ux, uy) = tb[j - 1];
+            let dot = (tx * ux + ty * uy).clamp(-1.0, 1.0);
+            let ang_cost = dot.acos() / std::f32::consts::FRAC_PI_2;
+            let best_prev = prev[j - 1]
+                .min(prev[j] + DTW_WARP_PENALTY)
+                .min(curr[j - 1] + DTW_WARP_PENALTY);
+            curr[j] = ang_cost + best_prev;
+        }
+        prev = curr;
+    }
+    (1.0 - prev[N_STEPS] / N_STEPS as f32).max(0.0)
+}
+
+/// DPI 归一化轨迹尺度门控：屏蔽微小误触抖动，并在达到标准有效行程后平滑过渡到满分权重 1.0。
+fn scale_completeness(total_len: f32, y_span: f32, is_chevron: bool, dpi_scale: f32) -> f32 {
+    let scale = dpi_scale.max(1.0);
+    let len_dp = total_len / scale;
+    let yspan_dp = y_span / scale;
+    if is_chevron {
+        if len_dp < 48.0 || yspan_dp < 22.0 {
+            return 0.0;
+        }
+        let f_len = (len_dp / 96.0).min(1.0);
+        let f_amp = (yspan_dp / 40.0).min(1.0);
+        (f_len * f_amp).sqrt()
+    } else {
+        if len_dp < 28.0 {
+            return 0.0;
+        }
+        (len_dp / 56.0).min(1.0)
+    }
+}
+
+/// 基于 Protractor 空间余弦 + 受限切线 DTW + DPI 尺度门控计算最佳手势及其百分比置信度（0..=100）。
+pub fn score_pts(pts: &[POINT], dpi_scale: f32) -> Option<(Gesture, f32)> {
+    let (resampled, total_len, _x_span, y_span) =
+        resample_with(pts.len(), |i| (pts[i].x as f32, pts[i].y as f32))?;
+    let norm = normalize_rms(&resampled);
+    let tangs = compute_tangents(&resampled);
+
+    let sf_line = scale_completeness(total_len, y_span, false, dpi_scale);
+    let sf_chev = scale_completeness(total_len, y_span, true, dpi_scale);
+    if sf_line <= 0.0 && sf_chev <= 0.0 {
+        return None;
+    }
+
+    let mut best_by_gesture = [0.0f32; 5];
+    for tmpl in templates() {
+        let sf = if tmpl.is_chevron { sf_chev } else { sf_line };
+        if sf <= 0.0 {
+            continue;
+        }
+        let sd = dtw_tangent_score(&tangs, &tmpl.tangents);
+        let sp = protractor_score(&norm, &tmpl.norm_pts);
+        let score = (0.55 * sd + 0.45 * sp) * sf * 100.0;
+        let slot = &mut best_by_gesture[tmpl.gesture.id() - 1];
+        if score > *slot {
+            *slot = score;
+        }
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_score = -1.0f32;
+    let mut second_score = -1.0f32;
+    for (idx, &s) in best_by_gesture.iter().enumerate() {
+        if s > best_score {
+            second_score = best_score;
+            best_score = s;
+            best_idx = idx;
+        } else if s > second_score {
+            second_score = s;
+        }
+    }
+
+    // 防止 45° 对角线等模糊轨迹在低阈值下因微小浮点差误判
+    if best_score <= 0.0 || best_score - second_score.max(0.0) < 1.5 {
+        return None;
+    }
+    Gesture::from_id(best_idx + 1).map(|g| (g, best_score))
+}
+
+/// 按指定匹配度阈值（百分比）与显示器 DPI 缩放比例识别五种预设手势。
+pub fn recognize_pts_with(pts: &[POINT], min_pct: u8, dpi_scale: f32) -> Option<Gesture> {
+    let threshold = crate::config::clamp_gesture_threshold(min_pct) as f32;
+    score_pts(pts, dpi_scale).and_then(|(g, score)| if score >= threshold { Some(g) } else { None })
 }
 
 fn is_extended_vk(vk: u16) -> bool {
@@ -518,11 +709,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0 {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
+            // 按下时采样当前显示器 DPI 缩放，保证不同缩放倍率屏幕下的有效行程一致
+            let dpi_scale = (crate::win32::dpi_at_point(mi.pt.x, mi.pt.y) as f32 / 96.0).max(1.0);
             let mut had_stale_trail = false;
             if let Ok(mut st) = STATE.lock() {
                 had_stale_trail = st.moved;
                 st.tracking = true;
                 st.moved = false;
+                st.dpi_scale = dpi_scale;
                 st.pts.clear();
                 st.pts.push(mi.pt);
                 st.trail.clear();
@@ -570,13 +764,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     if !st.moved {
                         let sdx = (mi.pt.x - st.start.x) as f32;
                         let sdy = (mi.pt.y - st.start.y) as f32;
-                        if sdx * sdx + sdy * sdy >= 20.0 * 20.0 {
+                        let deadzone = 16.0 * st.dpi_scale.max(1.0);
+                        if sdx * sdx + sdy * sdy >= deadzone * deadzone {
                             st.moved = true;
                             trail_updated = true;
                         }
                     }
                     if st.moved && trail_updated {
-                        let cur = recognize_pts(&st.pts);
+                        let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
+                        let cur = recognize_pts_with(&st.pts, threshold, st.dpi_scale);
                         next_snap = Some(TrailSnapshot {
                             active: true,
                             pts: st.trail.clone(),
@@ -612,7 +808,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                             st.pts.push(mi.pt);
                             st.trail.push(mi.pt);
                         }
-                        let rec = if had { recognize_pts(&st.pts) } else { None };
+                        let rec = if had {
+                            let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
+                            recognize_pts_with(&st.pts, threshold, st.dpi_scale)
+                        } else {
+                            None
+                        };
                         st.pts.clear();
                         st.trail.clear();
                         (true, had, rec)
@@ -657,25 +858,63 @@ mod tests {
 
     #[test]
     fn recognizes_straight_swipes() {
-        assert_eq!(recognize_pts(&[pt(0, 0), pt(-140, 8)]), Some(Gesture::Left));
-        assert_eq!(recognize_pts(&[pt(0, 0), pt(160, -10)]), Some(Gesture::Right));
-        assert_eq!(recognize_pts(&[pt(0, 0), pt(8, -120)]), Some(Gesture::Up));
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(-140, 8)], 70, 1.0), Some(Gesture::Left));
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(160, -10)], 70, 1.0), Some(Gesture::Right));
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(8, -120)], 70, 1.0), Some(Gesture::Up));
     }
 
     #[test]
     fn recognizes_diagonal_chevrons_and_rejects_noise() {
         // 45° 斜向 ∧（先右上再右下，复刻真实人手轨迹）
         assert_eq!(
-            recognize_pts(&[pt(0, 0), pt(25, -45), pt(48, -90), pt(72, -40), pt(96, 5)]),
+            recognize_pts_with(&[pt(0, 0), pt(25, -45), pt(48, -90), pt(72, -40), pt(96, 5)], 70, 1.0),
             Some(Gesture::UpDown)
         );
         // 45° 斜向 ∨（先右下再右上）
         assert_eq!(
-            recognize_pts(&[pt(0, 0), pt(25, 45), pt(50, 90), pt(75, 40), pt(100, -5)]),
+            recognize_pts_with(&[pt(0, 0), pt(25, 45), pt(50, 90), pt(75, 40), pt(100, -5)], 70, 1.0),
             Some(Gesture::DownUp)
         );
-        // 过短位移不识别
-        assert_eq!(recognize_pts(&[pt(0, 0), pt(15, 0)]), None);
+        // 自然不对称折线（第二段为第一段约 70%）在默认 70% 阈值下正常识别
+        assert_eq!(
+            recognize_pts_with(&[pt(0, 0), pt(35, -100), pt(70, -30)], 70, 1.0),
+            Some(Gesture::UpDown)
+        );
+        // 过短位移与微小试探折返不识别（防止满足一点点就触发）
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(15, 0)], 70, 1.0), None);
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(36, 0)], 70, 1.0), None);
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(20, -120), pt(40, -80)], 70, 1.0), None);
+        // 对勾、圆形、L 形、向下划等非目标轨迹不误判
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(20, 30), pt(80, -90)], 70, 1.0), None);
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(100, 0), pt(100, -100)], 70, 1.0), None);
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(0, 140)], 70, 1.0), None);
+        let circle: Vec<POINT> = (0..=24)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / 24.0;
+                pt((50.0 * a.cos()).round() as i32, (50.0 * a.sin()).round() as i32)
+            })
+            .collect();
+        assert_eq!(recognize_pts_with(&circle, 70, 1.0), None);
+    }
+
+    #[test]
+    fn threshold_percentage_and_dpi_scale_gate_work() {
+        // 约 30° 斜向左划：默认 70% 拒绝，降至 65% 允许通过
+        let tilted_30 = [pt(0, 0), pt(-120, 69)];
+        assert_eq!(recognize_pts_with(&tilted_30, 70, 1.0), None);
+        assert_eq!(recognize_pts_with(&tilted_30, 65, 1.0), Some(Gesture::Left));
+
+        // 25° 斜向左划：70% 通过，90% 严格模式拒绝
+        let tilted_25 = [pt(0, 0), pt(-120, 56)];
+        assert_eq!(recognize_pts_with(&tilted_25, 70, 1.0), Some(Gesture::Left));
+        assert_eq!(recognize_pts_with(&tilted_25, 90, 1.0), None);
+
+        // 45° 对角模糊轨迹即使降到最低 50% 也不应随机匹配相邻方向
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(-100, -100)], 50, 1.0), None);
+
+        // 高 DPI（200%）下 48px 物理位移仅相当于 24dp，应被尺度门控拦截；120px（60dp）正常通过
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(-48, 0)], 70, 2.0), None);
+        assert_eq!(recognize_pts_with(&[pt(0, 0), pt(-120, 0)], 70, 2.0), Some(Gesture::Left));
     }
 
     #[test]

@@ -22,8 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::app::{App, WM_APP_SCAN, WM_APP_UPDATE_EXIT};
 use crate::catalog::{self, AppEntry, ExpiredItem};
 use crate::config::{
-    snap_icon_size_dp, snap_scan_interval_secs, ICON_ROUNDNESS_PRESETS, ICON_SIZE_PRESETS,
-    SCAN_INTERVAL_PRESETS,
+    clamp_gesture_threshold, snap_icon_size_dp, snap_scan_interval_secs, DEFAULT_GESTURE_THRESHOLD,
+    GESTURE_THRESHOLD_STEP, ICON_ROUNDNESS_PRESETS, ICON_SIZE_PRESETS, MAX_GESTURE_THRESHOLD,
+    MIN_GESTURE_THRESHOLD, SCAN_INTERVAL_PRESETS,
 };
 use crate::hotkey::{self, HotkeySpec};
 use crate::icons::IconWorker;
@@ -123,6 +124,10 @@ enum Hit {
     // 鼠标手势
     ToggleGesture,
     ToggleGestureSwap,
+    GestureThreshDef,
+    GestureThreshDec,
+    GestureThreshInc,
+    GestureThreshVal,
     GestureCard(usize),
     // 关于
     About(about::Action),
@@ -230,6 +235,11 @@ struct Layout {
     gesture_toggle: RECT,
     gesture_row2: RECT,
     gesture_swap_toggle: RECT,
+    gesture_row3: RECT,
+    gesture_thresh_def_btn: RECT,
+    gesture_thresh_dec_btn: RECT,
+    gesture_thresh_val_rc: RECT,
+    gesture_thresh_inc_btn: RECT,
     gesture_cards: [RECT; 5],
     // Tab Refresh
     refresh_timer_card: RECT,
@@ -437,18 +447,27 @@ impl Dlg {
         let exp_row_h = s(46.0);
         let exp_vis = ((app_list_rc.bottom - app_list_rc.top) / exp_row_h).max(1) as usize;
 
-        // Tab Gestures
-        let gesture_card = RECT { left: content.left, top: content.top, right: content.right, bottom: content.top + s(104.0) };
-        let gesture_row1 = RECT { left: gesture_card.left, top: gesture_card.top, right: gesture_card.right, bottom: gesture_card.top + s(52.0) };
-        let gesture_row2 = RECT { left: gesture_card.left, top: gesture_card.top + s(52.0), right: gesture_card.right, bottom: gesture_card.bottom };
-        let gesture_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row1.top + (s(52.0) - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row1.top + (s(52.0) + th) / 2 };
-        let gesture_swap_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row2.top + (s(52.0) - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row2.top + (s(52.0) + th) / 2 };
+        // Tab Gestures（手势开关、方向反转、识别匹配度步进调节与下方五张只读手势卡）
+        let g_rh = s(44.0);
+        let gesture_card = RECT { left: content.left, top: content.top, right: content.right, bottom: content.top + g_rh * 3 };
+        let gesture_row1 = RECT { left: gesture_card.left, top: gesture_card.top, right: gesture_card.right, bottom: gesture_card.top + g_rh };
+        let gesture_row2 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh, right: gesture_card.right, bottom: gesture_card.top + g_rh * 2 };
+        let gesture_row3 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh * 2, right: gesture_card.right, bottom: gesture_card.bottom };
+        let gesture_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row1.top + (g_rh - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row1.top + (g_rh + th) / 2 };
+        let gesture_swap_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row2.top + (g_rh - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row2.top + (g_rh + th) / 2 };
+
+        let g_step_right = gesture_card.right - s(18.0);
+        let g_val_w = s(76.0);
+        let gesture_thresh_inc_btn = RECT { left: g_step_right - inc_w, top: gesture_row3.top + s(8.0), right: g_step_right, bottom: gesture_row3.bottom - s(8.0) };
+        let gesture_thresh_val_rc = RECT { left: gesture_thresh_inc_btn.left - s(4.0) - g_val_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_inc_btn.left - s(4.0), bottom: gesture_row3.bottom - s(8.0) };
+        let gesture_thresh_dec_btn = RECT { left: gesture_thresh_val_rc.left - s(4.0) - dec_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_val_rc.left - s(4.0), bottom: gesture_row3.bottom - s(8.0) };
+        let gesture_thresh_def_btn = RECT { left: gesture_thresh_dec_btn.left - s(10.0) - auto_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_dec_btn.left - s(10.0), bottom: gesture_row3.bottom - s(8.0) };
 
         // 预留卡片底部只读快捷键徽标高度，并保持上下卡片间距均衡
-        let g_top = gesture_card.bottom + s(14.0);
-        let g_gap = s(12.0);
+        let g_top = gesture_card.bottom + s(12.0);
+        let g_gap = s(10.0);
         let card_w3 = (cw - g_gap * 2) / 3;
-        let card_h = s(144.0);
+        let card_h = s(136.0);
         let g0 = RECT { left: content.left, top: g_top, right: content.left + card_w3, bottom: g_top + card_h };
         let g1 = RECT { left: g0.right + g_gap, top: g_top, right: g0.right + g_gap + card_w3, bottom: g_top + card_h };
         let g2 = RECT { left: g1.right + g_gap, top: g_top, right: content.right, bottom: g_top + card_h };
@@ -499,7 +518,9 @@ impl Dlg {
             folder_list_rc, folder_scroll_rc, folder_row_h, folder_vis, right_header,
             btn_folder_all, btn_tree_expand, btn_add_manual, btn_exp_back, btn_exp_del_all,
             app_list_rc, app_scroll_rc, app_row_h, app_vis, exp_row_h, exp_vis,
-            gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle, gesture_cards,
+            gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle,
+            gesture_row3, gesture_thresh_def_btn, gesture_thresh_dec_btn, gesture_thresh_val_rc, gesture_thresh_inc_btn,
+            gesture_cards,
             refresh_timer_card, refresh_interval_row, refresh_interval_presets, refresh_on_show_row, refresh_on_show_toggle,
             refresh_event_card, refresh_event_row, refresh_event_toggle, refresh_icons_row, refresh_icons_toggle,
             refresh_status_card, refresh_rebuild_btn, refresh_reset_btn,
@@ -1102,6 +1123,18 @@ impl Dlg {
                 if inside(&l.gesture_swap_toggle, x, y) || inside(&l.gesture_row2, x, y) {
                     return Hit::ToggleGestureSwap;
                 }
+                if inside(&l.gesture_thresh_def_btn, x, y) {
+                    return Hit::GestureThreshDef;
+                }
+                if inside(&l.gesture_thresh_dec_btn, x, y) {
+                    return Hit::GestureThreshDec;
+                }
+                if inside(&l.gesture_thresh_inc_btn, x, y) {
+                    return Hit::GestureThreshInc;
+                }
+                if inside(&l.gesture_thresh_val_rc, x, y) || inside(&l.gesture_row3, x, y) {
+                    return Hit::GestureThreshVal;
+                }
                 for (i, r) in l.gesture_cards.iter().enumerate() {
                     if inside(r, x, y) {
                         return Hit::GestureCard(i);
@@ -1337,6 +1370,35 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
                 None
             }
         }
+        Hit::ToggleGesture => Some((
+            Hit::ToggleGesture,
+            l.gesture_toggle,
+            "按住鼠标右键滑动触发手势，普通右键单击会自动回放".into(),
+        )),
+        Hit::ToggleGestureSwap => Some((
+            Hit::ToggleGestureSwap,
+            l.gesture_swap_toggle,
+            "反转向左/向右划对应的虚拟桌面切换方向".into(),
+        )),
+        Hit::GestureThreshDef => Some((
+            Hit::GestureThreshDef,
+            l.gesture_thresh_def_btn,
+            format!("恢复默认手势识别匹配度阈值（{DEFAULT_GESTURE_THRESHOLD}%）"),
+        )),
+        Hit::GestureThreshDec | Hit::GestureThreshInc | Hit::GestureThreshVal => {
+            let anchor = match hit {
+                Hit::GestureThreshDec => l.gesture_thresh_dec_btn,
+                Hit::GestureThreshInc => l.gesture_thresh_inc_btn,
+                _ => l.gesture_thresh_val_rc,
+            };
+            Some((
+                hit,
+                anchor,
+                format!(
+                    "手势形状与有效轨迹最低匹配度（{MIN_GESTURE_THRESHOLD}%–{MAX_GESTURE_THRESHOLD}%，默认 {DEFAULT_GESTURE_THRESHOLD}%）：越高越防误触，越低越容易触发"
+                ),
+            ))
+        }
         Hit::GestureCard(idx) => {
             let specs = gesture_card_specs(app.settings.gesture_swap_lr, &app.hotkey.display());
             specs.get(idx).map(|spec| (Hit::GestureCard(idx), l.gesture_cards[idx], spec.tip.clone()))
@@ -1554,6 +1616,7 @@ fn draw_stepper_row(
     dec_rc: &RECT,
     val_rc: &RECT,
     inc_rc: &RECT,
+    reset_label: &str,
     auto_hit: Hit,
     dec_hit: Hit,
     inc_hit: Hit,
@@ -1564,7 +1627,7 @@ fn draw_stepper_row(
     let lbl_rc = RECT { left: row_rc.left + (18.0 * s) as i32, top: row_rc.top, right: auto_rc.left - (10.0 * s) as i32, bottom: row_rc.bottom };
     draw_text(dc, label, dlg.font_body, &lbl_rc, rgb(0x111827, 1.0), TextAlign::Left, true, false);
 
-    // 「自动」切换胶囊
+    // 快捷重置胶囊（如网格行列「自动」或手势匹配度「默认」）
     let auto_hov = dlg.hover == auto_hit;
     let auto_prs = dlg.pressed == auto_hit;
     let (abg, abd, atc) = if is_auto {
@@ -1578,7 +1641,7 @@ fn draw_stepper_row(
     };
     sf.fill_rrect(auto_rc, 7.0 * s, abg);
     sf.stroke_rrect(auto_rc, 7.0 * s, (1.1 * s).max(1.0), abd);
-    draw_text(dc, "自动", dlg.font_sub, auto_rc, atc, TextAlign::Center, true, false);
+    draw_text(dc, reset_label, dlg.font_sub, auto_rc, atc, TextAlign::Center, true, false);
 
     draw_button(sf, dc, dec_rc, "-", dlg.font_btn, BtnStyle::Secondary, dlg.hover == dec_hit, dlg.pressed == dec_hit, s);
     sf.fill_rrect(val_rc, 7.0 * s, rgb(0xFFFFFF, 1.0));
@@ -1695,7 +1758,7 @@ fn paint_tab_general(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     draw_stepper_row(
         sf, dc, dlg, "启动台网格列数", &l.cols_row,
         &l.cols_auto_btn, &l.cols_dec_btn, &l.cols_val_rc, &l.cols_inc_btn,
-        Hit::ColsAuto, Hit::ColsDec, Hit::ColsInc, cols_auto, &cols_txt, s,
+        "自动", Hit::ColsAuto, Hit::ColsDec, Hit::ColsInc, cols_auto, &cols_txt, s,
     );
 
     let rows_auto = app.settings.grid_rows <= 0;
@@ -1707,7 +1770,7 @@ fn paint_tab_general(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     draw_stepper_row(
         sf, dc, dlg, "启动台网格行数", &l.rows_row,
         &l.rows_auto_btn, &l.rows_dec_btn, &l.rows_val_rc, &l.rows_inc_btn,
-        Hit::RowsAuto, Hit::RowsDec, Hit::RowsInc, rows_auto, &rows_txt, s,
+        "自动", Hit::RowsAuto, Hit::RowsDec, Hit::RowsInc, rows_auto, &rows_txt, s,
     );
     draw_button(sf, dc, &l.layout_reset_btn, "恢复默认", dlg.font_sub, BtnStyle::Secondary, dlg.hover == Hit::LayoutReset, dlg.pressed == Hit::LayoutReset, s);
 }
@@ -2170,7 +2233,9 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
     if dlg.hover == Hit::ToggleGestureSwap {
         sf.fill_rrect(&l.gesture_row2, 10.0 * s, rgb(0xF1F5F9, 0.7));
     }
-    sf.fill_rect(&RECT { left: l.gesture_card.left + (16.0 * s) as i32, top: l.gesture_row2.top, right: l.gesture_card.right - (16.0 * s) as i32, bottom: l.gesture_row2.top + 1 }, rgb(0xE2E8F0, 1.0));
+    for sep_y in [l.gesture_row2.top, l.gesture_row3.top] {
+        sf.fill_rect(&RECT { left: l.gesture_card.left + (16.0 * s) as i32, top: sep_y, right: l.gesture_card.right - (16.0 * s) as i32, bottom: sep_y + 1 }, rgb(0xE2E8F0, 1.0));
+    }
 
     let r1 = RECT { left: l.gesture_row1.left + (18.0 * s) as i32, top: l.gesture_row1.top, right: l.gesture_toggle.left - (12.0 * s) as i32, bottom: l.gesture_row1.bottom };
     let r2 = RECT { left: l.gesture_row2.left + (18.0 * s) as i32, top: l.gesture_row2.top, right: l.gesture_swap_toggle.left - (12.0 * s) as i32, bottom: l.gesture_row2.bottom };
@@ -2179,6 +2244,16 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
     draw_toggle(sf, &l.gesture_toggle, app.settings.gestures_enabled, dlg.hover == Hit::ToggleGesture, dlg.pressed == Hit::ToggleGesture, s);
     draw_toggle(sf, &l.gesture_swap_toggle, app.settings.gesture_swap_lr, dlg.hover == Hit::ToggleGestureSwap, dlg.pressed == Hit::ToggleGestureSwap, s);
 
+    // 复用通用步进控件展示手势识别最低匹配度百分比（50%–95%，默认 70%）
+    let thresh = clamp_gesture_threshold(app.settings.gesture_threshold);
+    let thresh_txt = format!("{thresh}%");
+    draw_stepper_row(
+        sf, dc, dlg, "手势识别匹配度", &l.gesture_row3,
+        &l.gesture_thresh_def_btn, &l.gesture_thresh_dec_btn, &l.gesture_thresh_val_rc, &l.gesture_thresh_inc_btn,
+        "默认", Hit::GestureThreshDef, Hit::GestureThreshDec, Hit::GestureThreshInc,
+        thresh == DEFAULT_GESTURE_THRESHOLD, &thresh_txt, s,
+    );
+
     let specs = gesture_card_specs(app.settings.gesture_swap_lr, &app.hotkey.display());
     for (i, spec) in specs.iter().enumerate() {
         let cr = &l.gesture_cards[i];
@@ -2186,19 +2261,19 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
         sf.fill_rrect(cr, 10.0 * s, if hov { rgb(0xF8FAFC, 1.0) } else { rgb(0xFFFFFF, 1.0) });
         sf.stroke_rrect(cr, 10.0 * s, (1.1 * s).max(1.0), if hov { rgb(0x93C5FD, 1.0) } else { rgb(0xE2E8F0, 1.0) });
         let gcx = (cr.left + cr.right) as f32 * 0.5;
-        let gcy = cr.top as f32 + 37.0 * s;
-        draw_gesture_glyph(sf, gcx, gcy, 44.0 * s, spec.glyph, s);
+        let gcy = cr.top as f32 + 34.0 * s;
+        draw_gesture_glyph(sf, gcx, gcy, 42.0 * s, spec.glyph, s);
         let nr = RECT {
             left: cr.left + (8.0 * s).round() as i32,
-            top: cr.top + (63.0 * s).round() as i32,
+            top: cr.top + (59.0 * s).round() as i32,
             right: cr.right - (8.0 * s).round() as i32,
-            bottom: cr.top + (85.0 * s).round() as i32,
+            bottom: cr.top + (80.0 * s).round() as i32,
         };
         let ar = RECT {
             left: cr.left + (8.0 * s).round() as i32,
-            top: cr.top + (84.0 * s).round() as i32,
+            top: cr.top + (79.0 * s).round() as i32,
             right: cr.right - (8.0 * s).round() as i32,
-            bottom: cr.top + (103.0 * s).round() as i32,
+            bottom: cr.top + (97.0 * s).round() as i32,
         };
         draw_text(dc, spec.name, dlg.font_section, &nr, rgb(0x111827, 1.0), TextAlign::Center, true, false);
         draw_text(dc, spec.action, dlg.font_sub, &ar, rgb(0x64748B, 1.0), TextAlign::Center, true, false);
@@ -2211,9 +2286,9 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
         let pill_cx = (cr.left + cr.right) / 2;
         let pill_rc = RECT {
             left: pill_cx - pill_w / 2,
-            top: cr.top + (109.0 * s).round() as i32,
+            top: cr.top + (102.0 * s).round() as i32,
             right: pill_cx + (pill_w - pill_w / 2),
-            bottom: cr.bottom - (12.0 * s).round() as i32,
+            bottom: cr.bottom - (11.0 * s).round() as i32,
         };
         let pill_tc = if hov { rgb(0x334155, 1.0) } else { rgb(0x475569, 1.0) };
         sf.fill_rrect(&pill_rc, 6.0 * s, rgb(0xF1F5F9, 1.0));
@@ -2775,6 +2850,24 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             app.settings.gesture_swap_lr = !app.settings.gesture_swap_lr;
                             app.store.save_settings(&app.settings);
                         }
+                        Hit::GestureThreshDef => {
+                            if app.settings.gesture_threshold != DEFAULT_GESTURE_THRESHOLD {
+                                app.apply_gesture_threshold(DEFAULT_GESTURE_THRESHOLD);
+                                app.store.save_settings(&app.settings);
+                            }
+                        }
+                        Hit::GestureThreshDec | Hit::GestureThreshInc => {
+                            let cur = clamp_gesture_threshold(app.settings.gesture_threshold);
+                            let next = if hit == Hit::GestureThreshDec {
+                                cur.saturating_sub(GESTURE_THRESHOLD_STEP).max(MIN_GESTURE_THRESHOLD)
+                            } else {
+                                cur.saturating_add(GESTURE_THRESHOLD_STEP).min(MAX_GESTURE_THRESHOLD)
+                            };
+                            if next != cur {
+                                app.apply_gesture_threshold(next);
+                                app.store.save_settings(&app.settings);
+                            }
+                        }
                         Hit::About(action) => match action {
                             about::Action::Version(index) => dlg.about.toggle(&l.about, index),
                             about::Action::GitHub => open_shell_path("open", "https://github.com/CrazyFigure/WinLaunchpad", None),
@@ -2890,6 +2983,10 @@ mod tests {
             let (tw, _) = measure_text(dc, &spec.shortcut, font);
             assert!(tw > 0 && tw + 18 <= 173, "快捷键过宽: {} ({tw}px)", spec.shortcut);
         }
+        let (pw, _) = measure_text(dc, "95%", font);
+        assert!(pw > 0 && pw + 12 <= 76, "手势匹配度数值框过宽 ({pw}px)");
+        let (dw, _) = measure_text(dc, "默认", font);
+        assert!(dw > 0 && dw + 10 <= 48, "默认按钮过宽 ({dw}px)");
         unsafe {
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
