@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::app::App;
 use crate::catalog::AppEntry;
 use crate::ui::{
-    draw_button, draw_rocket_badge, draw_scrollbar, draw_text, draw_tooltip, make_font, rgb,
+    draw_app_badge, draw_button, draw_scrollbar, draw_text, draw_tooltip, make_font, rgb,
     BtnStyle, DibTarget, TextAlign,
 };
 use crate::win32::*;
@@ -452,8 +452,8 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     surface.thick_line(close_cx - arm, close_cy - arm, close_cx + arm, close_cy + arm, (1.7 * s).max(1.2), cross_c);
     surface.thick_line(close_cx - arm, close_cy + arm, close_cx + arm, close_cy - arm, (1.7 * s).max(1.2), cross_c);
 
-    // 顶部火箭徽标与标题
-    draw_rocket_badge(&mut surface, l.rocket_cx, l.rocket_cy, l.rocket_sz, s);
+    // 顶部软件徽标与标题
+    draw_app_badge(&mut surface, l.rocket_cx, l.rocket_cy, l.rocket_sz, s);
     draw_text(dc, "启动台", dlg.font_title, &l.title_rc, rgb(0x111827, 1.0), TextAlign::Center, true, false);
     draw_text(dc, "请将 .exe、.lnk 文件拖放到此处", dlg.font_sub, &l.sub_rc, rgb(0x64748B, 1.0), TextAlign::Center, true, false);
 
@@ -671,6 +671,9 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                if !dlg.app.is_null() {
+                    (*dlg.app).ensure_gesture_alive();
+                }
                 let l = dlg.layout();
                 let hit = dlg.hit_test(&l, get_x_lparam(lparam.0), get_y_lparam(lparam.0));
                 update_tip(dlg, &l, hit);

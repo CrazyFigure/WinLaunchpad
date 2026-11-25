@@ -2047,6 +2047,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                app.ensure_gesture_alive();
                 let l = dlg.layout();
                 let x = get_x_lparam(lparam.0);
                 let y = get_y_lparam(lparam.0);

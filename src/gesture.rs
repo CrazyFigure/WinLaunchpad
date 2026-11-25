@@ -1,11 +1,15 @@
-﻿//! 可选内置右键手势（默认关闭）。独立线程安装 WH_MOUSE_LL 钩子：
-//! 按住右键滑动 → 采集轨迹点 → 几何特征识别 → 通知主线程执行动作。
-//! 未形成手势的普通右键会被吞掉后回放，保证右键菜单正常弹出。
+﻿//! 可选内置右键手势（默认关闭）。独立高优先级线程安装 WH_MOUSE_LL 钩子：
+//! 回调内仅做轻量采样、状态裁决与非阻塞派发，绝不在钩子内同步调用 SendInput；
+//! 普通右键回放与快捷键动作由独立发送线程异步执行，避免触发系统低级钩子超时失效。
 
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::Threading::{
+    GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW,
@@ -19,6 +23,7 @@ pub const WM_APP_GESTURE: u32 = WM_APP + 5;
 pub const WM_APP_GESTURE_HUD: u32 = WM_APP + 9;
 const MSG_ENABLE: u32 = WM_APP + 20;
 const MSG_DISABLE: u32 = WM_APP + 21;
+const MSG_REINSTALL: u32 = WM_APP + 22;
 const MAGIC_EXTRA: usize = 0x574C_5041;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,30 +57,90 @@ impl Gesture {
         }
     }
 
-    pub fn hud_label(self, swap_lr: bool) -> &'static str {
+    /// 返回实时轨迹浮窗展示的简洁动作名称。
+    pub fn hud_label(self, swap_lr: bool, launchpad_visible: bool) -> &'static str {
         match self {
             Gesture::Left => {
                 if swap_lr {
-                    "← 切换桌面（向左）"
+                    "← 向左切桌面"
                 } else {
-                    "← 切换桌面（向右）"
+                    "← 向右切桌面"
                 }
             }
             Gesture::Right => {
                 if swap_lr {
-                    "→ 切换桌面（向右）"
+                    "→ 向右切桌面"
                 } else {
-                    "→ 切换桌面（向左）"
+                    "→ 向左切桌面"
                 }
             }
-            Gesture::Up => "↑ 切换窗口",
-            Gesture::UpDown => "∧ 启动台",
-            Gesture::DownUp => "∨ 任务视图",
+            Gesture::Up => "切换窗口",
+            Gesture::UpDown => {
+                if launchpad_visible {
+                    "收起启动台"
+                } else {
+                    "打开启动台"
+                }
+            }
+            Gesture::DownUp => "全部窗口",
         }
     }
 }
 
+/// 供主线程实时绘制手势轨迹浮窗的轻量快照。
+#[derive(Clone, Default)]
+pub struct TrailSnapshot {
+    pub active: bool,
+    pub pts: Vec<POINT>,
+    pub cursor: POINT,
+    pub gesture: Option<Gesture>,
+}
+
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
+static LAST_HOOK_TICK: AtomicU64 = AtomicU64::new(0);
+static LAST_REINSTALL_TICK: AtomicU64 = AtomicU64::new(0);
+static TRAIL_DIRTY: AtomicBool = AtomicBool::new(false);
+
+static TRAIL_SNAPSHOT: Mutex<TrailSnapshot> = Mutex::new(TrailSnapshot {
+    active: false,
+    pts: Vec::new(),
+    cursor: POINT { x: 0, y: 0 },
+    gesture: None,
+});
+
+enum SenderCmd {
+    ReplayRightClick,
+    Perform(Gesture, bool),
+}
+
+static SENDER_TX: OnceLock<mpsc::Sender<SenderCmd>> = OnceLock::new();
+
+fn sender_tx() -> &'static mpsc::Sender<SenderCmd> {
+    SENDER_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<SenderCmd>();
+        let _ = std::thread::Builder::new()
+            .name("gesture-sender".into())
+            .spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        SenderCmd::ReplayRightClick => replay_click(),
+                        SenderCmd::Perform(g, swap_lr) => perform(g, swap_lr),
+                    }
+                }
+            });
+        tx
+    })
+}
+
+/// 取出最新的实时轨迹快照并清除脏标记。
+pub fn take_trail_snapshot() -> TrailSnapshot {
+    TRAIL_DIRTY.store(false, Ordering::Release);
+    TRAIL_SNAPSHOT
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
 
 #[derive(Default)]
 struct State {
@@ -83,8 +148,9 @@ struct State {
     moved: bool,
     start: POINT,
     last: POINT,
+    last_trail: POINT,
     pts: Vec<POINT>,
-    last_hud: Option<Gesture>,
+    trail: Vec<POINT>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -92,8 +158,9 @@ static STATE: Mutex<State> = Mutex::new(State {
     moved: false,
     start: POINT { x: 0, y: 0 },
     last: POINT { x: 0, y: 0 },
+    last_trail: POINT { x: 0, y: 0 },
     pts: Vec::new(),
-    last_hud: None,
+    trail: Vec::new(),
 });
 
 pub struct GestureHandle {
@@ -101,36 +168,75 @@ pub struct GestureHandle {
 }
 
 impl GestureHandle {
-    pub fn set_enabled(&self, on: bool) {
-        let msg_id = if on { MSG_ENABLE } else { MSG_DISABLE };
+    fn post_cmd(&self, msg_id: u32) -> bool {
         unsafe {
-            // 若消息队列偶发繁忙，短重试保证启用/禁用手势命令不静默丢失
+            // 若消息队列偶发繁忙，短重试保证启用/禁用/重装命令不静默丢失
             for attempt in 0..3 {
                 if PostThreadMessageW(self.thread_id, msg_id, WPARAM(0), LPARAM(0)).is_ok() {
-                    return;
+                    return true;
                 }
                 if attempt < 2 {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
+            false
+        }
+    }
+
+    pub fn set_enabled(&self, on: bool) {
+        HOOK_ENABLED.store(on, Ordering::SeqCst);
+        let msg_id = if on { MSG_ENABLE } else { MSG_DISABLE };
+        if !self.post_cmd(msg_id) {
             log::log(&format!("发送手势线程消息失败 (on={on})"));
         }
     }
+
+    /// 当非提权自有窗口收到鼠标事件却长时间未触发钩子时，判定系统已静默脱钩并自动重装。
+    pub fn ensure_alive(&self) {
+        if !HOOK_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = unsafe { GetTickCount64() };
+        let last = LAST_HOOK_TICK.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > 650 {
+            let prev = LAST_REINSTALL_TICK.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) > 1500
+                && LAST_REINSTALL_TICK
+                    .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let _ = self.post_cmd(MSG_REINSTALL);
+            }
+        }
+    }
+
+    /// 系统睡眠唤醒后强制重新挂载低级鼠标钩子，避免休眠后钩子链失效。
+    pub fn force_reinstall(&self) {
+        if !HOOK_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = unsafe { GetTickCount64() };
+        LAST_REINSTALL_TICK.store(now, Ordering::Relaxed);
+        let _ = self.post_cmd(MSG_REINSTALL);
+    }
 }
 
-/// 启动手势线程（初始不装钩子）。
+/// 启动手势线程与异步发送线程（初始不装钩子）。
 pub fn start(main_hwnd: HWND) -> Option<GestureHandle> {
     MAIN_HWND.store(main_hwnd.0 as isize, Ordering::SeqCst);
+    let _ = sender_tx();
     let (tx, rx) = std::sync::mpsc::channel::<u32>();
     std::thread::Builder::new()
         .name("gesture-hook".into())
         .spawn(move || {
             let mut hook: Option<HHOOK> = None;
             unsafe {
+                // 提升钩子消息泵优先级，防止主界面或扫描子进程 CPU 尖峰导致钩子响应超时被系统摘除
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
                 let mut msg = MSG::default();
                 // 必须先通过 PeekMessageW 创建本线程消息队列，再通知主线程 thread_id，防止 PostThreadMessageW 竞态丢失
                 let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
-                let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                let tid = GetCurrentThreadId();
                 let _ = tx.send(tid);
                 loop {
                     let r = GetMessageW(&mut msg, None, 0, 0);
@@ -147,6 +253,7 @@ pub fn start(main_hwnd: HWND) -> Option<GestureHandle> {
                                 match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod, 0) {
                                     Ok(h) => {
                                         hook = Some(h);
+                                        LAST_HOOK_TICK.store(GetTickCount64(), Ordering::Relaxed);
                                         log::log("手势钩子已安装");
                                     }
                                     Err(e) => log::log(&format!(
@@ -161,6 +268,26 @@ pub fn start(main_hwnd: HWND) -> Option<GestureHandle> {
                                 let _ = UnhookWindowsHookEx(h);
                                 reset_state();
                                 log::log("手势钩子已卸载");
+                            }
+                        }
+                        MSG_REINSTALL => {
+                            if HOOK_ENABLED.load(Ordering::Relaxed) {
+                                if let Some(h) = hook.take() {
+                                    let _ = UnhookWindowsHookEx(h);
+                                }
+                                reset_state();
+                                let hmod = crate::win32::hinstance();
+                                match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod, 0) {
+                                    Ok(h) => {
+                                        hook = Some(h);
+                                        LAST_HOOK_TICK.store(GetTickCount64(), Ordering::Relaxed);
+                                        log::log("手势钩子已重新安装");
+                                    }
+                                    Err(e) => log::log(&format!(
+                                        "手势钩子重装失败: {}",
+                                        crate::win32::error_string(e)
+                                    )),
+                                }
                             }
                         }
                         _ => {
@@ -184,8 +311,14 @@ fn reset_state() {
         st.tracking = false;
         st.moved = false;
         st.pts.clear();
-        st.last_hud = None;
+        st.trail.clear();
     }
+    if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
+        snap.active = false;
+        snap.pts.clear();
+        snap.gesture = None;
+    }
+    TRAIL_DIRTY.store(false, Ordering::Release);
 }
 
 /// 基于几何拐点与弦长比识别五种预设手势，容忍人手划动的轻微弧度与斜角。
@@ -302,6 +435,11 @@ fn replay_click() {
     }
 }
 
+/// 异步执行手势对应的系统快捷键，避免阻塞主界面消息循环与手势钩子。
+pub fn perform_async(g: Gesture, swap_lr: bool) {
+    let _ = sender_tx().send(SenderCmd::Perform(g, swap_lr));
+}
+
 /// 执行手势对应的系统快捷键（支持左右切桌面方向反转）。
 pub fn perform(g: Gesture, swap_lr: bool) {
     let (lctrl, lalt, lwin, tab, left, right) = (0xA2u16, 0xA4u16, 0x5Bu16, 0x09u16, 0x25u16, 0x27u16);
@@ -348,84 +486,160 @@ pub fn perform(g: Gesture, swap_lr: bool) {
     }
 }
 
+/// 点序列达到上限时抽稀中间采样点，同时完整保留起点、终点与整体曲线走向。
+fn compact_points(pts: &mut Vec<POINT>) {
+    if pts.len() < 4 {
+        return;
+    }
+    let last = *pts.last().unwrap();
+    let mut kept = Vec::with_capacity(pts.len() / 2 + 2);
+    kept.push(pts[0]);
+    for i in (1..pts.len() - 1).step_by(2) {
+        kept.push(pts[i]);
+    }
+    kept.push(last);
+    *pts = kept;
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
+    // 每次进入回调即刷新心跳时间戳，供主线程检测系统是否静默摘除了低级钩子
+    LAST_HOOK_TICK.store(GetTickCount64(), Ordering::Relaxed);
     let mi = &*(lparam.0 as *const MSLLHOOKSTRUCT);
     if mi.flags & LLMHF_INJECTED != 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
     let msg = wparam.0 as u32;
     let main = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
-    let Ok(mut st) = STATE.lock() else {
-        return CallNextHookEx(None, code, wparam, lparam);
-    };
     match msg {
         WM_RBUTTONDOWN => {
             if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0 {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
-            st.tracking = true;
-            st.moved = false;
-            st.pts.clear();
-            st.pts.push(mi.pt);
-            st.start = mi.pt;
-            st.last = mi.pt;
-            st.last_hud = None;
+            let mut had_stale_trail = false;
+            if let Ok(mut st) = STATE.lock() {
+                had_stale_trail = st.moved;
+                st.tracking = true;
+                st.moved = false;
+                st.pts.clear();
+                st.pts.push(mi.pt);
+                st.trail.clear();
+                st.trail.push(mi.pt);
+                st.start = mi.pt;
+                st.last = mi.pt;
+                st.last_trail = mi.pt;
+            }
+            if had_stale_trail {
+                if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
+                    snap.active = false;
+                    snap.pts.clear();
+                    snap.gesture = None;
+                }
+                TRAIL_DIRTY.store(true, Ordering::Release);
+                let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(0), LPARAM(0));
+            }
             LRESULT(1)
         }
         WM_MOUSEMOVE => {
-            if st.tracking {
-                let dx = (mi.pt.x - st.last.x) as f32;
-                let dy = (mi.pt.y - st.last.y) as f32;
-                if dx * dx + dy * dy >= 64.0 {
-                    st.pts.push(mi.pt);
-                    st.last = mi.pt;
-                    if st.pts.len() > 256 {
-                        st.pts.remove(1);
+            let mut next_snap: Option<TrailSnapshot> = None;
+            if let Ok(mut st) = STATE.lock() {
+                if st.tracking {
+                    let tdx = (mi.pt.x - st.last_trail.x) as f32;
+                    let tdy = (mi.pt.y - st.last_trail.y) as f32;
+                    let mut trail_updated = false;
+                    // 每移动约 3px 采集一个高密度渲染点，确保实时手势曲线平滑无棱角
+                    if tdx * tdx + tdy * tdy >= 9.0 {
+                        if st.trail.len() >= 512 {
+                            compact_points(&mut st.trail);
+                        }
+                        st.trail.push(mi.pt);
+                        st.last_trail = mi.pt;
+                        trail_updated = true;
+                    }
+                    let dx = (mi.pt.x - st.last.x) as f32;
+                    let dy = (mi.pt.y - st.last.y) as f32;
+                    if dx * dx + dy * dy >= 49.0 {
+                        if st.pts.len() >= 256 {
+                            compact_points(&mut st.pts);
+                        }
+                        st.pts.push(mi.pt);
+                        st.last = mi.pt;
                     }
                     if !st.moved {
                         let sdx = (mi.pt.x - st.start.x) as f32;
                         let sdy = (mi.pt.y - st.start.y) as f32;
-                        if sdx * sdx + sdy * sdy >= 24.0 * 24.0 {
+                        if sdx * sdx + sdy * sdy >= 20.0 * 20.0 {
                             st.moved = true;
+                            trail_updated = true;
                         }
                     }
-                    if st.moved {
+                    if st.moved && trail_updated {
                         let cur = recognize_pts(&st.pts);
-                        if cur != st.last_hud {
-                            st.last_hud = cur;
-                            let gid = cur.map(|g| g.id()).unwrap_or(0);
-                            let lp = (((mi.pt.y & 0xFFFF) as isize) << 16)
-                                | ((mi.pt.x & 0xFFFF) as isize);
-                            let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(gid), LPARAM(lp));
-                        }
+                        next_snap = Some(TrailSnapshot {
+                            active: true,
+                            pts: st.trail.clone(),
+                            cursor: mi.pt,
+                            gesture: cur,
+                        });
                     }
+                }
+            }
+            // 先释放 STATE 锁，再更新渲染快照与投递合并通知，绝不在锁内调用系统消息 API
+            if let Some(s) = next_snap {
+                if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
+                    *snap = s;
+                }
+                if TRAIL_DIRTY
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(1), LPARAM(0));
                 }
             }
             CallNextHookEx(None, code, wparam, lparam)
         }
         WM_RBUTTONUP => {
-            if !st.tracking {
+            let (was_tracking, had_trail, g) = match STATE.lock() {
+                Ok(mut st) => {
+                    if !st.tracking {
+                        (false, false, None)
+                    } else {
+                        st.tracking = false;
+                        let had = st.moved;
+                        if had {
+                            st.pts.push(mi.pt);
+                            st.trail.push(mi.pt);
+                        }
+                        let rec = if had { recognize_pts(&st.pts) } else { None };
+                        st.pts.clear();
+                        st.trail.clear();
+                        (true, had, rec)
+                    }
+                }
+                Err(_) => (false, false, None),
+            };
+            if !was_tracking {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
-            st.tracking = false;
-            if st.moved {
-                st.pts.push(mi.pt);
-            }
-            let g = if st.moved { recognize_pts(&st.pts) } else { None };
-            let had_hud = st.last_hud.take().is_some();
-            st.pts.clear();
-            drop(st);
-            if had_hud {
+            if had_trail {
+                if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
+                    snap.active = false;
+                    snap.pts.clear();
+                    snap.gesture = None;
+                }
+                TRAIL_DIRTY.store(true, Ordering::Release);
                 let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(0), LPARAM(0));
             }
             match g {
                 Some(g) => {
                     let _ = PostMessageW(main, WM_APP_GESTURE, WPARAM(g.id()), LPARAM(0));
                 }
-                None => replay_click(),
+                None => {
+                    // 通过独立发送线程回放右键，避免钩子回调内阻塞于 SendInput
+                    let _ = sender_tx().send(SenderCmd::ReplayRightClick);
+                }
             }
             LRESULT(1)
         }
@@ -462,5 +676,21 @@ mod tests {
         );
         // 过短位移不识别
         assert_eq!(recognize_pts(&[pt(0, 0), pt(15, 0)]), None);
+    }
+
+    #[test]
+    fn hud_labels_and_compaction_work() {
+        assert_eq!(Gesture::UpDown.hud_label(false, false), "打开启动台");
+        assert_eq!(Gesture::UpDown.hud_label(false, true), "收起启动台");
+        assert_eq!(Gesture::DownUp.hud_label(false, false), "全部窗口");
+        assert_ne!(Gesture::Left.hud_label(false, false), Gesture::Left.hud_label(true, false));
+
+        let mut pts: Vec<POINT> = (0..20).map(|i| pt(i * 4, i * 2)).collect();
+        let first = pts[0];
+        let last = *pts.last().unwrap();
+        compact_points(&mut pts);
+        assert_eq!(pts[0], first);
+        assert_eq!(*pts.last().unwrap(), last);
+        assert!(pts.len() < 20);
     }
 }

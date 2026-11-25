@@ -326,6 +326,18 @@ impl IconCache {
         self.sprite_order.clear();
         self.sprite_bytes = 0;
     }
+
+    /// 隐藏后保留约一页常用图标精灵缓存，兼顾空闲低内存占用与再次呼出瞬时响应。
+    pub fn trim_sprites_to(&mut self, budget: usize) {
+        while self.sprite_bytes > budget {
+            let Some(old_k) = self.sprite_order.pop_front() else {
+                break;
+            };
+            if let Some(b) = self.sprites.remove(&old_k) {
+                self.sprite_bytes -= (b.w * b.h * 4) as usize;
+            }
+        }
+    }
 }
 
 // ---------- 右键浮层菜单与帧描述 ----------
@@ -530,12 +542,12 @@ impl Renderer {
         self.bg_sig = sig;
     }
 
-    /// 隐藏窗口后释放屏幕尺寸 DIB 与半分辨率背景，保留轻量原图纹理。
+    /// 隐藏窗口后释放屏幕尺寸 DIB 与半分辨率背景，仅保留轻量一页图标精灵以消除二次呼出卡顿。
     pub fn release_target(&mut self) {
         self.target.release();
         self.bg_half.release();
         self.bg_sig = (0, 0, 0, false);
-        self.icons.clear_sprites();
+        self.icons.trim_sprites_to(2 * 1024 * 1024);
     }
 
     pub fn add_icon(&mut self, key: &str, pixels: &[u8], w: u32, h: u32) {
@@ -688,91 +700,162 @@ impl Renderer {
 
     pub fn paint(&mut self, hwnd: HWND, f: &Frame<'_>, layout: &Layout) -> bool {
         if !self.ensure_target(hwnd, layout.w.max(1) as u32, layout.h.max(1) as u32, self.scale) {
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut ps);
+                let _ = EndPaint(hwnd, &ps);
+            }
             return false;
         }
         self.ensure_bg_half(layout.w, layout.h, f.use_wallpaper);
         let dc = self.target.mem_dc.unwrap();
 
-        // 高速 2× 拉伸拷贝半分辨率背景（仅约 1.5ms）
+        let mut ps = PAINTSTRUCT::default();
+        let wdc = unsafe { BeginPaint(hwnd, &mut ps) };
+        if wdc.is_invalid() {
+            return true;
+        }
+        let prc = ps.rcPaint;
+        let paint_rc = if prc.right > prc.left && prc.bottom > prc.top {
+            RECT {
+                left: prc.left.max(0),
+                top: prc.top.max(0),
+                right: prc.right.min(layout.w),
+                bottom: prc.bottom.min(layout.h),
+            }
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: layout.w,
+                bottom: layout.h,
+            }
+        };
+        let pw = (paint_rc.right - paint_rc.left).max(0);
+        let ph = (paint_rc.bottom - paint_rc.top).max(0);
+        if pw == 0 || ph == 0 {
+            unsafe {
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return true;
+        }
+
+        // 高速 2× 拉伸拷贝半分辨率背景（局部脏区更新时仅拉伸对齐后的脏矩形）
         if let Some(bdc) = self.bg_half.mem_dc {
             unsafe {
                 let _ = SetStretchBltMode(dc, COLORONCOLOR);
-                let _ = StretchBlt(
-                    dc,
-                    0,
-                    0,
-                    layout.w,
-                    layout.h,
-                    bdc,
-                    0,
-                    0,
-                    self.bg_half.w,
-                    self.bg_half.h,
-                    SRCCOPY,
-                );
+                if layout.w % 2 == 0
+                    && layout.h % 2 == 0
+                    && self.bg_half.w == layout.w / 2
+                    && self.bg_half.h == layout.h / 2
+                    && (pw < layout.w || ph < layout.h)
+                {
+                    let ax0 = paint_rc.left & !1;
+                    let ay0 = paint_rc.top & !1;
+                    let ax1 = ((paint_rc.right + 1) & !1).min(layout.w);
+                    let ay1 = ((paint_rc.bottom + 1) & !1).min(layout.h);
+                    let aw = (ax1 - ax0).max(0);
+                    let ah = (ay1 - ay0).max(0);
+                    if aw > 0 && ah > 0 {
+                        let _ = StretchBlt(
+                            dc,
+                            ax0,
+                            ay0,
+                            aw,
+                            ah,
+                            bdc,
+                            ax0 / 2,
+                            ay0 / 2,
+                            aw / 2,
+                            ah / 2,
+                            SRCCOPY,
+                        );
+                    }
+                } else {
+                    let _ = StretchBlt(
+                        dc,
+                        0,
+                        0,
+                        layout.w,
+                        layout.h,
+                        bdc,
+                        0,
+                        0,
+                        self.bg_half.w,
+                        self.bg_half.h,
+                        SRCCOPY,
+                    );
+                }
             }
         }
 
         let Some(mut surface) = self.target.surface() else {
+            unsafe {
+                let _ = EndPaint(hwnd, &ps);
+            }
             return false;
         };
         let s = self.scale;
+        let top_bar_bottom = layout.search.bottom.max(layout.settings_btn.bottom).max(layout.add_btn.bottom);
+        let need_top_bar = paint_rc.top <= top_bar_bottom + 2;
 
-        // 1. 顶部磨砂搜索胶囊（空框时由编辑框统一居中画放大镜与「搜索」，有输入时放大镜固定左侧）
-        let sb_col = (self.search_bg_rgb.0, self.search_bg_rgb.1, self.search_bg_rgb.2, 1.0);
-        surface.fill_rrect(&layout.search, 9.0 * s, sb_col);
-        surface.stroke_rrect(&layout.search, 9.0 * s, (1.0 * s).max(1.0), C_SEARCH_BORDER);
+        if need_top_bar {
+            // 1. 顶部磨砂搜索胶囊（空框时由编辑框统一居中画放大镜与「搜索」，有输入时放大镜固定左侧）
+            let sb_col = (self.search_bg_rgb.0, self.search_bg_rgb.1, self.search_bg_rgb.2, 1.0);
+            surface.fill_rrect(&layout.search, 9.0 * s, sb_col);
+            surface.stroke_rrect(&layout.search, 9.0 * s, (1.0 * s).max(1.0), C_SEARCH_BORDER);
 
-        if !f.query_empty {
-            let cx = layout.search.left as f32 + 18.0 * s;
-            let cy = (layout.search.top + layout.search.bottom) as f32 * 0.5;
-            let icon_col = C_TEXT_DIM;
-            surface.stroke_circle(cx, cy - 1.0 * s, 5.2 * s, (1.5 * s).max(1.0), icon_col);
-            surface.thick_line(
-                cx + 3.6 * s,
-                cy + 2.6 * s,
-                cx + 7.4 * s,
-                cy + 6.4 * s,
-                (1.6 * s).max(1.0),
-                icon_col,
-            );
-        }
+            if !f.query_empty {
+                let cx = layout.search.left as f32 + 18.0 * s;
+                let cy = (layout.search.top + layout.search.bottom) as f32 * 0.5;
+                let icon_col = C_TEXT_DIM;
+                surface.stroke_circle(cx, cy - 1.0 * s, 5.2 * s, (1.5 * s).max(1.0), icon_col);
+                surface.thick_line(
+                    cx + 3.6 * s,
+                    cy + 2.6 * s,
+                    cx + 7.4 * s,
+                    cy + 6.4 * s,
+                    (1.6 * s).max(1.0),
+                    icon_col,
+                );
+            }
 
-        // 2. 右上角圆角玻璃图标按钮（+ 添加、⚙ 设置）
-        for (r, hit) in [(&layout.add_btn, Hit::Add), (&layout.settings_btn, Hit::Settings)] {
-            let is_hov = f.hover_btn == Some(hit);
-            let is_prs = f.pressed_btn == Some(hit);
-            let bg = if is_prs {
-                C_PILL_PRESS
-            } else if is_hov {
-                C_PILL_HOVER
-            } else {
-                C_PILL_BG
-            };
-            surface.fill_rrect(r, 10.0 * s, bg);
-            surface.stroke_rrect(
-                r,
-                10.0 * s,
-                (1.0 * s).max(1.0),
-                (1.0, 1.0, 1.0, if is_hov { 0.30 } else { 0.14 }),
-            );
-            let bx = (r.left + r.right) as f32 * 0.5;
-            let by = (r.top + r.bottom) as f32 * 0.5;
-            let c = if is_hov || is_prs { C_TEXT } else { C_TEXT_DIM };
-            if hit == Hit::Add {
-                let arm = 6.0 * s;
-                let sw = (1.8 * s).max(1.2);
-                surface.thick_line(bx - arm, by, bx + arm, by, sw, c);
-                surface.thick_line(bx, by - arm, bx, by + arm, sw, c);
-            } else {
-                let rad = 5.4 * s;
-                surface.stroke_circle(bx, by, rad, (1.7 * s).max(1.2), c);
-                surface.fill_circle(bx, by, 1.6 * s, c);
-                for k in 0..6 {
-                    let ang = k as f32 * std::f32::consts::PI / 3.0;
-                    let px = bx + ang.cos() * (rad + 2.2 * s);
-                    let py = by + ang.sin() * (rad + 2.2 * s);
-                    surface.fill_circle(px, py, 1.25 * s, c);
+            // 2. 右上角圆角玻璃图标按钮（+ 添加、⚙ 设置）
+            for (r, hit) in [(&layout.add_btn, Hit::Add), (&layout.settings_btn, Hit::Settings)] {
+                let is_hov = f.hover_btn == Some(hit);
+                let is_prs = f.pressed_btn == Some(hit);
+                let bg = if is_prs {
+                    C_PILL_PRESS
+                } else if is_hov {
+                    C_PILL_HOVER
+                } else {
+                    C_PILL_BG
+                };
+                surface.fill_rrect(r, 10.0 * s, bg);
+                surface.stroke_rrect(
+                    r,
+                    10.0 * s,
+                    (1.0 * s).max(1.0),
+                    (1.0, 1.0, 1.0, if is_hov { 0.30 } else { 0.14 }),
+                );
+                let bx = (r.left + r.right) as f32 * 0.5;
+                let by = (r.top + r.bottom) as f32 * 0.5;
+                let c = if is_hov || is_prs { C_TEXT } else { C_TEXT_DIM };
+                if hit == Hit::Add {
+                    let arm = 6.0 * s;
+                    let sw = (1.8 * s).max(1.2);
+                    surface.thick_line(bx - arm, by, bx + arm, by, sw, c);
+                    surface.thick_line(bx, by - arm, bx, by + arm, sw, c);
+                } else {
+                    let rad = 5.4 * s;
+                    surface.stroke_circle(bx, by, rad, (1.7 * s).max(1.2), c);
+                    surface.fill_circle(bx, by, 1.6 * s, c);
+                    for k in 0..6 {
+                        let ang = k as f32 * std::f32::consts::PI / 3.0;
+                        let px = bx + ang.cos() * (rad + 2.2 * s);
+                        let py = by + ang.sin() * (rad + 2.2 * s);
+                        surface.fill_circle(px, py, 1.25 * s, c);
+                    }
                 }
             }
         }
@@ -893,9 +976,7 @@ impl Renderer {
         }
 
         unsafe {
-            let mut ps = PAINTSTRUCT::default();
-            let wdc = BeginPaint(hwnd, &mut ps);
-            let _ = BitBlt(wdc, 0, 0, layout.w, layout.h, dc, 0, 0, SRCCOPY);
+            let _ = BitBlt(wdc, paint_rc.left, paint_rc.top, pw, ph, dc, paint_rc.left, paint_rc.top, SRCCOPY);
             let _ = EndPaint(hwnd, &ps);
         }
         true

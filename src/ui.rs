@@ -126,6 +126,18 @@ impl Default for DibTarget {
 }
 
 impl DibTarget {
+    /// 确保后备缓冲至少达到指定宽高，按 128px 分档扩容以避免实时手势拖动期间频繁重建 DIB。
+    pub fn ensure_at_least(&mut self, w: i32, h: i32) -> bool {
+        let w = w.max(1);
+        let h = h.max(1);
+        if self.mem_dc.is_some() && self.w >= w && self.h >= h && !self.ptr.is_null() {
+            return true;
+        }
+        let bw = (((w + 127) / 128) * 128).max(128);
+        let bh = (((h + 127) / 128) * 128).max(128);
+        self.ensure(bw, bh)
+    }
+
     pub fn ensure(&mut self, w: i32, h: i32) -> bool {
         let w = w.max(1);
         let h = h.max(1);
@@ -234,6 +246,62 @@ impl Surface {
         let px = pack_bgra(c.0, c.1, c.2);
         let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
         slice.fill(px);
+    }
+
+    /// 将指定矩形区域清空为全透明像素（0x00000000），供 UpdateLayeredWindow 透明浮窗复用缓冲。
+    pub fn clear_rect_transparent(&mut self, w: i32, h: i32) {
+        let cw = (w.max(0) as usize).min(self.w);
+        let ch = (h.max(0) as usize).min(self.h);
+        if cw == 0 || ch == 0 {
+            return;
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
+        for y in 0..ch {
+            let row = y * self.w;
+            slice[row..row + cw].fill(0);
+        }
+    }
+
+    /// 将指定矩形区域清空为纯黑不透明像素，供 GDI 文字生成灰度 Alpha 遮罩使用。
+    pub fn clear_rect_black(&mut self, w: i32, h: i32) {
+        let cw = (w.max(0) as usize).min(self.w);
+        let ch = (h.max(0) as usize).min(self.h);
+        if cw == 0 || ch == 0 {
+            return;
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
+        for y in 0..ch {
+            let row = y * self.w;
+            slice[row..row + cw].fill(0xFF00_0000);
+        }
+    }
+
+    /// 在透明表面上执行标准预乘 BGRA Porter-Duff OVER 合成，保证 RGB 始终 <= A。
+    #[inline]
+    pub fn blend_premul_over(&mut self, x: i32, y: i32, b: u32, g: u32, r: u32, a: u32) {
+        if a == 0 || !self.in_bounds(x, y) {
+            return;
+        }
+        let p = unsafe { &mut *self.ptr.add(y as usize * self.w + x as usize) };
+        if a >= 255 {
+            *p = 0xFF00_0000 | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
+            return;
+        }
+        let dst = *p;
+        if dst == 0 {
+            *p = (a << 24) | (r.min(a) << 16) | (g.min(a) << 8) | b.min(a);
+            return;
+        }
+        let ia = 255 - a;
+        let da = (dst >> 24) & 0xFF;
+        let dr = (dst >> 16) & 0xFF;
+        let dg = (dst >> 8) & 0xFF;
+        let db = dst & 0xFF;
+        let out_a = (a + (da * ia + 127) / 255).min(255);
+        let out_r = (r + (dr * ia + 127) / 255).min(out_a);
+        let out_g = (g + (dg * ia + 127) / 255).min(out_a);
+        let out_b = (b + (db * ia + 127) / 255).min(out_a);
+        *p = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
     }
 
     pub fn clear_vertical_gradient(&mut self, top: (f32, f32, f32), mid: (f32, f32, f32), bottom: (f32, f32, f32)) {
@@ -703,14 +771,43 @@ fn is_card_shape(px: &[u8], w: usize, h: usize) -> Option<(f32, f32, f32, f32)> 
         }
         px[(y as usize * w + x as usize) * 4 + 3]
     };
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w as i32, h as i32, -1i32, -1i32);
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            if at_a(x, y) > 120 {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
+    let mut min_y = h as i32;
+    let mut max_y = -1i32;
+    'top: for y in 0..h as i32 {
+        let row = y as usize * w * 4;
+        for x in 0..w {
+            if px[row + x * 4 + 3] > 120 {
+                min_y = y;
+                break 'top;
+            }
+        }
+    }
+    if min_y >= h as i32 {
+        return None;
+    }
+    'bot: for y in (min_y..h as i32).rev() {
+        let row = y as usize * w * 4;
+        for x in 0..w {
+            if px[row + x * 4 + 3] > 120 {
+                max_y = y;
+                break 'bot;
+            }
+        }
+    }
+    let mut min_x = w as i32;
+    let mut max_x = -1i32;
+    for y in min_y..=max_y {
+        let row = y as usize * w * 4;
+        for x in 0..min_x {
+            if px[row + x as usize * 4 + 3] > 120 {
+                min_x = x;
+                break;
+            }
+        }
+        for x in (max_x + 1..w as i32).rev() {
+            if px[row + x as usize * 4 + 3] > 120 {
+                max_x = x;
+                break;
             }
         }
     }
@@ -736,7 +833,7 @@ fn is_card_shape(px: &[u8], w: usize, h: usize) -> Option<(f32, f32, f32, f32)> 
     }
 }
 
-/// 按给定圆角弧度对正方形前景层（卡片型图标）就地执行抗锯齿圆角遮罩裁切。
+/// 按给定圆角弧度对正方形前景层（卡片型图标）就地执行抗锯齿圆角遮罩裁切（仅计算四角区域）。
 fn apply_card_roundness(fg: &mut [u8], w: usize, h: usize, round_ratio: f32) {
     let Some((bx, by, cw, ch)) = is_card_shape(fg, w, h) else {
         return;
@@ -746,9 +843,25 @@ fn apply_card_roundness(fg: &mut [u8], w: usize, h: usize, round_ratio: f32) {
     let rcy = by + ch * 0.5;
     let half_w = (cw * 0.5 - rad).max(0.0);
     let half_h = (ch * 0.5 - rad).max(0.0);
+    let pad = rad.ceil() as i32 + 2;
+    let inner_l = (bx as i32 + pad).max(0);
+    let inner_r = ((bx + cw).ceil() as i32 - pad).min(w as i32);
+    let inner_t = (by as i32 + pad).max(0);
+    let inner_b = ((by + ch).ceil() as i32 - pad).min(h as i32);
     for y in 0..h as i32 {
+        let in_mid_y = inner_t < inner_b && y >= inner_t && y < inner_b;
         let fy = y as f32 + 0.5;
         for x in 0..w as i32 {
+            // 卡片中心十字区一定在圆角内部，跳过无谓的逐像素 SDF 开方运算
+            if in_mid_y && inner_l < inner_r && x >= inner_l && x < inner_r {
+                continue;
+            }
+            if (x as f32 + 0.5 >= bx + 1.0 && (x as f32 + 0.5) < bx + cw - 1.0)
+                && (fy >= by + 1.0 && fy < by + ch - 1.0)
+                && ((x >= inner_l && x < inner_r) || (y >= inner_t && y < inner_b))
+            {
+                continue;
+            }
             let fx = x as f32 + 0.5;
             let qx = (fx - rcx).abs() - half_w;
             let qy = (fy - rcy).abs() - half_h;
@@ -1199,8 +1312,8 @@ pub fn draw_tooltip(
     draw_text(dc, text, font, &text_rc, rgb(0xF8FAFC, 0.98), TextAlign::Center, true, false);
 }
 
-/// 绘制参考图 5 风格的 macOS 火箭启动台图标徽标。
-pub fn draw_rocket_badge(surface: &mut Surface, cx: f32, cy: f32, size: f32, scale: f32) {
+/// 绘制软件自身图标徽标（复刻 assets/app.ico：45° 紫蓝渐变圆角方框 + 3×3 白色网格方块）。
+pub fn draw_app_badge(surface: &mut Surface, cx: f32, cy: f32, size: f32, scale: f32) {
     let half = size * 0.5;
     let r = RECT {
         left: (cx - half).round() as i32,
@@ -1214,42 +1327,258 @@ pub fn draw_rocket_badge(surface: &mut Surface, cx: f32, cy: f32, size: f32, sca
         right: r.right,
         bottom: r.bottom + (4.0 * scale).round() as i32,
     };
-    let rad = size * 0.23;
-    surface.fill_rrect(&shadow, rad, (0.0, 0.0, 0.0, 0.14));
+    let rad = size * (29.0 / 240.0);
+    surface.fill_rrect(&shadow, rad, (0.0, 0.0, 0.0, 0.15));
 
-    // 渐变银灰圆角底板
+    // 45° 对角线渐变底板（#4F7CFF → #7B3FE4）
     let x0 = r.left.max(0);
     let y0 = r.top.max(0);
     let x1 = r.right.min(surface.w as i32);
     let y1 = r.bottom.min(surface.h as i32);
     let (fl, ft, fr, fb) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+    let span = (size * 2.0).max(1.0);
+    let (c1r, c1g, c1b) = (0x4F as f32 / 255.0, 0x7C as f32 / 255.0, 1.0);
+    let (c2r, c2g, c2b) = (0x7B as f32 / 255.0, 0x3F as f32 / 255.0, 0xE4 as f32 / 255.0);
     for y in y0..y1 {
-        let t = ((y as f32 - ft) / size.max(1.0)).clamp(0.0, 1.0);
-        let base = 0.72 - 0.19 * t; // 亮银灰到中灰
+        let fy = y as f32 + 0.5;
         for x in x0..x1 {
-            let d = Surface::sd_rrect(x as f32 + 0.5, y as f32 + 0.5, fl, ft, fr, fb, rad);
+            let fx = x as f32 + 0.5;
+            let d = Surface::sd_rrect(fx, fy, fl, ft, fr, fb, rad);
             if d < 0.5 {
                 let cov = (0.5 - d).clamp(0.0, 1.0);
-                surface.blend(x, y, (base, base + 0.02, base + 0.04, cov));
+                let t = (((fx - fl) + (fy - ft)) / span).clamp(0.0, 1.0);
+                let cr = c1r + (c2r - c1r) * t;
+                let cg = c1g + (c2g - c1g) * t;
+                let cb = c1b + (c2b - c1b) * t;
+                surface.blend(x, y, (cr, cg, cb, cov));
             }
         }
     }
-    surface.stroke_rrect(&r, rad, (1.0 * scale).max(1.0), (1.0, 1.0, 1.0, 0.45));
+    surface.stroke_rrect(&r, rad, (1.0 * scale).max(1.0), (1.0, 1.0, 1.0, 0.24));
 
-    // 45° 斜向深色火箭剪影
-    let u = size / 64.0;
-    let dark = rgb(0x1E242B, 0.96);
-    // 机身主轴（由左下向右上倾斜 45°）
-    surface.thick_line(cx - 10.0 * u, cy + 10.0 * u, cx + 11.0 * u, cy - 11.0 * u, 11.5 * u, dark);
-    surface.fill_circle(cx + 12.5 * u, cy - 12.5 * u, 4.2 * u, dark);
-    surface.fill_circle(cx + 15.0 * u, cy - 15.0 * u, 2.2 * u, dark);
-    // 左翼与右翼
-    surface.thick_line(cx - 8.0 * u, cy - 1.0 * u, cx - 15.0 * u, cy + 1.5 * u, 4.2 * u, dark);
-    surface.thick_line(cx + 1.0 * u, cy + 8.0 * u, cx - 1.5 * u, cy + 15.0 * u, 4.2 * u, dark);
-    // 尾焰点缀
-    surface.thick_line(cx - 13.0 * u, cy + 13.0 * u, cx - 17.5 * u, cy + 17.5 * u, 4.6 * u, dark);
-    // 舷窗高光
-    surface.fill_circle(cx + 4.0 * u, cy - 4.0 * u, 2.4 * u, rgb(0xAEB6C2, 0.9));
+    // 居中 3×3 白色圆角网格（比例与 assets/app.ico 一致）
+    let cell = size * (52.0 / 240.0);
+    let gap = size * (16.0 / 240.0);
+    let cell_rad = (size * (6.0 / 240.0)).max(1.4);
+    let total = cell * 3.0 + gap * 2.0;
+    let ox = cx - total * 0.5;
+    let oy = cy - total * 0.5;
+    let white = rgb(0xFFFFFF, 0.98);
+    for row in 0..3 {
+        for col in 0..3 {
+            let gx = ox + col as f32 * (cell + gap);
+            let gy = oy + row as f32 * (cell + gap);
+            let gr = RECT {
+                left: gx.round() as i32,
+                top: gy.round() as i32,
+                right: (gx + cell).round() as i32,
+                bottom: (gy + cell).round() as i32,
+            };
+            surface.fill_rrect(&gr, cell_rad, white);
+        }
+    }
+}
+
+/// 在透明 DIB 上以最大覆盖度缓冲绘制 Catmull-Rom 平滑亮青手势轨迹（消除转角透明叠加暗斑）。
+pub fn draw_gesture_trail(
+    surface: &mut Surface,
+    pts: &[(f32, f32)],
+    stroke_w: f32,
+    col: Rgba,
+    view_w: i32,
+    view_h: i32,
+    cov_buf: &mut Vec<f32>,
+) {
+    if pts.is_empty() || view_w <= 0 || view_h <= 0 {
+        return;
+    }
+    let vw = (view_w as usize).min(surface.w);
+    let vh = (view_h as usize).min(surface.h);
+    let need = vw * vh;
+    if cov_buf.len() < need {
+        cov_buf.resize(need, 0.0);
+    }
+    cov_buf[..need].fill(0.0);
+
+    // 1. 对采样点执行 Catmull-Rom 样条细分，使快速划动曲线顺滑无折角
+    let mut smooth = Vec::with_capacity(pts.len() * 4);
+    if pts.len() <= 2 {
+        smooth.extend_from_slice(pts);
+    } else {
+        for i in 0..pts.len() - 1 {
+            let p0 = if i == 0 { pts[0] } else { pts[i - 1] };
+            let p1 = pts[i];
+            let p2 = pts[i + 1];
+            let p3 = if i + 2 < pts.len() { pts[i + 2] } else { pts[i + 1] };
+            let seg_len = ((p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2)).sqrt();
+            let steps = ((seg_len / 3.0).ceil() as usize).clamp(1, 8);
+            if i == 0 {
+                smooth.push(p1);
+            }
+            for s in 1..=steps {
+                let t = s as f32 / steps as f32;
+                let t2 = t * t;
+                let t3 = t2 * t;
+                let x = 0.5
+                    * (2.0 * p1.0
+                        + (-p0.0 + p2.0) * t
+                        + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                        + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+                let y = 0.5
+                    * (2.0 * p1.1
+                        + (-p0.1 + p2.1) * t
+                        + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                        + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+                smooth.push((x, y));
+            }
+        }
+    }
+
+    // 2. 写入最大覆盖度缓冲（保证线段连接处绝不产生重复透明加深）
+    let half = stroke_w * 0.5;
+    let pad = half + 1.5;
+    if smooth.len() == 1 {
+        let (cx, cy) = smooth[0];
+        let x0 = (cx - pad).floor().max(0.0) as i32;
+        let y0 = (cy - pad).floor().max(0.0) as i32;
+        let x1 = (cx + pad).ceil().min(vw as f32) as i32;
+        let y1 = (cy + pad).ceil().min(vh as f32) as i32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                let cov = (half + 0.6 - d).clamp(0.0, 1.0);
+                let idx = y as usize * vw + x as usize;
+                if cov > cov_buf[idx] {
+                    cov_buf[idx] = cov;
+                }
+            }
+        }
+    } else {
+        for seg in smooth.windows(2) {
+            let (ax, ay) = seg[0];
+            let (bx, by) = seg[1];
+            let vx = bx - ax;
+            let vy = by - ay;
+            let len2 = vx * vx + vy * vy;
+            let x0 = (ax.min(bx) - pad).floor().max(0.0) as i32;
+            let y0 = (ay.min(by) - pad).floor().max(0.0) as i32;
+            let x1 = (ax.max(bx) + pad).ceil().min(vw as f32) as i32;
+            let y1 = (ay.max(by) + pad).ceil().min(vh as f32) as i32;
+            for y in y0..y1 {
+                let py = y as f32 + 0.5 - ay;
+                let row = y as usize * vw;
+                for x in x0..x1 {
+                    let px = x as f32 + 0.5 - ax;
+                    let h = if len2 > 1e-4 {
+                        ((px * vx + py * vy) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let dx = px - vx * h;
+                    let dy = py - vy * h;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < half + 0.6 {
+                        let cov = (half + 0.6 - d).clamp(0.0, 1.0);
+                        let idx = row + x as usize;
+                        if cov > cov_buf[idx] {
+                            cov_buf[idx] = cov;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 将覆盖度转化为合法预乘 BGRA 写入透明 Surface
+    for y in 0..vh {
+        let row = y * vw;
+        for x in 0..vw {
+            let cov = cov_buf[row + x];
+            if cov <= 0.002 {
+                continue;
+            }
+            let a = (cov * col.3 * 255.0).round().clamp(0.0, 255.0) as u32;
+            if a == 0 {
+                continue;
+            }
+            let r = ((col.0 * a as f32).round() as u32).min(a);
+            let g = ((col.1 * a as f32).round() as u32).min(a);
+            let b = ((col.2 * a as f32).round() as u32).min(a);
+            surface.blend_premul_over(x as i32, y as i32, b, g, r, a);
+        }
+    }
+}
+
+/// 将 GDI 文字按灰度遮罩合成到全透明分层窗口 Surface（带柔和微阴影，兼顾深浅壁纸清晰度）。
+pub fn draw_transparent_text(
+    surface: &mut Surface,
+    scratch: &mut DibTarget,
+    text: &str,
+    font: HFONT,
+    rect: &RECT,
+    col: Rgba,
+    scale: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let tw = (rect.right - rect.left).max(1);
+    let th = (rect.bottom - rect.top).max(1);
+    if !scratch.ensure_at_least(tw, th) {
+        return;
+    }
+    if let Some(mut ssf) = scratch.surface() {
+        ssf.clear_rect_black(tw, th);
+    }
+    let Some(sdc) = scratch.mem_dc else { return };
+    let local_rc = RECT {
+        left: 0,
+        top: 0,
+        right: tw,
+        bottom: th,
+    };
+    draw_text(sdc, text, font, &local_rc, rgb(0xFFFFFF, 1.0), TextAlign::Left, true, false);
+    if scratch.ptr.is_null() {
+        return;
+    }
+    let src_stride = scratch.w as usize;
+    let src_slice = unsafe {
+        std::slice::from_raw_parts(scratch.ptr as *const u32, src_stride * scratch.h as usize)
+    };
+    let sdy = (1.0 * scale).round().max(1.0) as i32;
+    let cr_f = col.0.clamp(0.0, 1.0);
+    let cg_f = col.1.clamp(0.0, 1.0);
+    let cb_f = col.2.clamp(0.0, 1.0);
+    let ca_f = col.3.clamp(0.0, 1.0);
+
+    // 先叠加轻微下沉投影，确保在极暗或极亮壁纸上都能锐利识别
+    for ly in 0..th {
+        let row = ly as usize * src_stride;
+        for lx in 0..tw {
+            let mask = (src_slice[row + lx as usize] >> 8) & 0xFF;
+            if mask > 12 {
+                let sa = (mask * 72) >> 8;
+                surface.blend_premul_over(rect.left + lx, rect.top + ly + sdy, 0, 0, 0, sa);
+            }
+        }
+    }
+    for ly in 0..th {
+        let row = ly as usize * src_stride;
+        for lx in 0..tw {
+            let mask = (src_slice[row + lx as usize] >> 8) & 0xFF;
+            if mask == 0 {
+                continue;
+            }
+            let a = ((mask as f32 * ca_f).round() as u32).min(255);
+            if a == 0 {
+                continue;
+            }
+            let r = ((cr_f * a as f32).round() as u32).min(a);
+            let g = ((cg_f * a as f32).round() as u32).min(a);
+            let b = ((cb_f * a as f32).round() as u32).min(a);
+            surface.blend_premul_over(rect.left + lx, rect.top + ly, b, g, r, a);
+        }
+    }
 }
 
 /// 绘制参考图 6 风格的蓝色手势矢量轨迹与箭头。
@@ -1306,5 +1635,61 @@ pub fn draw_gesture_glyph(surface: &mut Surface, cx: f32, cy: f32, size: f32, gl
             let len = (dx * dx + dy * dy).sqrt().max(1.0);
             arrow(surface, x1, y1, dx / len, dy / len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gesture_trail_produces_valid_premultiplied_alpha() {
+        let (w, h) = (160, 160);
+        let mut buf = vec![0u32; w * h];
+        let mut sf = Surface {
+            w,
+            h,
+            ptr: buf.as_mut_ptr(),
+            clip: None,
+        };
+        let mut cov = Vec::new();
+        let pts = [(20.0, 20.0), (50.0, 120.0), (90.0, 130.0), (135.0, 30.0)];
+        draw_gesture_trail(&mut sf, &pts, 6.0, rgb(0x00AEFF, 0.96), w as i32, h as i32, &mut cov);
+
+        let mut non_zero = 0usize;
+        for &px in &buf {
+            let a = (px >> 24) & 0xFF;
+            let r = (px >> 16) & 0xFF;
+            let g = (px >> 8) & 0xFF;
+            let b = px & 0xFF;
+            assert!(r <= a && g <= a && b <= a, "premultiplied invariant violated: {px:#010X}");
+            if a > 0 {
+                non_zero += 1;
+            }
+        }
+        assert!(non_zero > 50);
+        // 远离轨迹的角落像素应保持全透明
+        assert_eq!(buf[0], 0);
+    }
+
+    #[test]
+    fn app_badge_renders_white_center_grid_and_gradient() {
+        let (w, h) = (128, 128);
+        let mut buf = vec![0xFFFF_FFFFu32; w * h];
+        let mut sf = Surface {
+            w,
+            h,
+            ptr: buf.as_mut_ptr(),
+            clip: None,
+        };
+        draw_app_badge(&mut sf, 64.0, 64.0, 64.0, 1.0);
+        // 正中心属于九宫格第 (1,1) 个白色方块，应呈纯白近似像素
+        let center = buf[64 * w + 64];
+        assert!(((center >> 16) & 0xFF) > 240);
+        assert!(((center >> 8) & 0xFF) > 240);
+        assert!((center & 0xFF) > 240);
+        // 左上角圆角区域内部应带蓝色渐变分量
+        let tl = buf[40 * w + 40];
+        assert!((tl & 0xFF) > ((tl >> 16) & 0xFF));
     }
 }

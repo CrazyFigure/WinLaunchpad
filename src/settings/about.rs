@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{IntersectClipRect, RestoreDC, SaveDC, HDC};
 
 use super::{inside, Dlg, Hit};
 use crate::ui::{
-    draw_button, draw_rocket_badge, draw_scrollbar, draw_text, rgb, BtnStyle, Surface, TextAlign,
+    draw_app_badge, draw_button, draw_scrollbar, draw_text, rgb, BtnStyle, Surface, TextAlign,
 };
 use crate::update::{self, Channel, Release};
 
@@ -309,9 +309,9 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
         bottom: parent.top + p(top + height),
     };
 
-    // 头部保留原有图标，版本号来自 Cargo，和 EXE 版本使用同一发布校验。
+    // 头部使用软件自身图标，版本号来自 Cargo，和 EXE 版本使用同一发布校验。
     sf.fill_rrect(&l.hero, 14.0 * s, rgb(0xF1F6FF, 1.0));
-    draw_rocket_badge(
+    draw_app_badge(
         sf,
         (l.hero.left + p(55)) as f32,
         (l.hero.top + p(52)) as f32,

@@ -1,14 +1,16 @@
-﻿//! 主窗口与应用状态：全屏覆盖（含任务栏）、搜索框、丝滑滑动翻页、空白退出、右键菜单、手势 HUD 与子进程调度。
+﻿//! 主窗口与应用状态：全屏覆盖（含任务栏）、搜索框、丝滑滑动翻页、空白退出、右键菜单、实时轨迹浮窗与子进程调度。
 
+use std::collections::VecDeque;
 use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW,
-    InvalidateRect, MonitorFromPoint, SetBkColor, SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect,
+    MonitorFromPoint, SetBkColor, SetTextColor, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER,
+    BLENDFUNCTION, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -32,9 +34,18 @@ use crate::render::{
 };
 use crate::startup;
 use crate::tray::{self, Tray};
-use crate::ui::{draw_text, make_font, measure_text, rgb, DibTarget, IconPixels, TextAlign};
+use crate::ui::{
+    draw_gesture_trail, draw_text, draw_transparent_text, make_font, measure_text, rgb, DibTarget,
+    IconPixels, TextAlign,
+};
 use crate::wallpaper;
 use crate::win32::*;
+
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(uPeriod: u32) -> u32;
+    fn timeEndPeriod(uPeriod: u32) -> u32;
+}
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_SCAN: u32 = WM_APP + 2;
@@ -48,7 +59,10 @@ const TIMER_FADE: usize = 1;
 const TIMER_SLIDE: usize = 2;
 const TIMER_TOOLTIP: usize = 3;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const SLIDE_DURATION_MS: f32 = 210.0;
+const FADE_DURATION_MS: f32 = 135.0;
+const WM_POWERBROADCAST_MSG: u32 = 0x0218;
+const PBT_APMRESUMESUSPEND_WPARAM: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC_WPARAM: usize = 0x0012;
 
 #[derive(Clone, PartialEq, Eq)]
 enum TipTarget {
@@ -63,138 +77,290 @@ pub struct VisibleItem {
     pub valid: bool,
 }
 
-/// 全局手势实时提示小浮窗（不抢焦点、鼠标穿透、仅约 25KB）。
-struct GestureHud {
+/// 全局手势实时轨迹与动作提示透明分层浮窗（类似 Quicker：亮青顺滑轨迹 + 光标旁悬空文字，零点击拦截）。
+struct GestureOverlay {
     hwnd: HWND,
     target: DibTarget,
+    text_target: DibTarget,
+    cov_buf: Vec<f32>,
     font: HFONT,
-    text: String,
     scale: f32,
+    visible: bool,
 }
 
-impl GestureHud {
+impl GestureOverlay {
     fn new() -> Self {
         Self {
             hwnd: HWND::default(),
             target: DibTarget::default(),
+            text_target: DibTarget::default(),
+            cov_buf: Vec::new(),
             font: HFONT::default(),
-            text: String::new(),
             scale: 1.0,
+            visible: false,
         }
     }
 
-    fn show_at(&mut self, hinst: HINSTANCE, owner: HWND, x: i32, y: i32, label: &str) {
+    fn ensure_window(&mut self, hinst: HINSTANCE) -> bool {
+        if !self.hwnd.is_invalid() {
+            return true;
+        }
         unsafe {
-            if self.hwnd.is_invalid() {
-                let wc = WNDCLASSEXW {
-                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    style: CS_HREDRAW | CS_VREDRAW,
-                    lpfnWndProc: Some(hud_proc),
-                    hInstance: hinst,
-                    hbrBackground: HBRUSH::default(),
-                    lpszClassName: w!("WinLaunchpadGestureHud"),
-                    ..Default::default()
-                };
-                let _ = RegisterClassExW(&wc);
-                self.hwnd = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-                    w!("WinLaunchpadGestureHud"),
-                    w!(""),
-                    WS_POPUP,
-                    0,
-                    0,
-                    160,
-                    36,
-                    owner,
-                    None,
-                    hinst,
-                    Some(self as *mut GestureHud as *const _),
-                )
-                .unwrap_or_default();
-                if !self.hwnd.is_invalid() {
-                    enable_rounded_window(self.hwnd);
-                }
-            }
-            if self.hwnd.is_invalid() {
-                return;
-            }
-            let dpi = dpi_at_point(x, y);
-            let scale = dpi as f32 / 96.0;
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(overlay_proc),
+                hInstance: hinst,
+                hbrBackground: HBRUSH::default(),
+                lpszClassName: w!("WinLaunchpadGestureOverlay"),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+            self.hwnd = CreateWindowExW(
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_LAYERED,
+                w!("WinLaunchpadGestureOverlay"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+        }
+        !self.hwnd.is_invalid()
+    }
+
+    fn update(
+        &mut self,
+        hinst: HINSTANCE,
+        snap: &gesture::TrailSnapshot,
+        swap_lr: bool,
+        launchpad_visible: bool,
+    ) {
+        if !snap.active || snap.pts.is_empty() {
+            self.hide();
+            return;
+        }
+        if !self.ensure_window(hinst) {
+            return;
+        }
+        unsafe {
+            let cx = snap.cursor.x;
+            let cy = snap.cursor.y;
+            let dpi = dpi_at_point(cx, cy);
+            let scale = (dpi as f32 / 96.0).max(1.0);
             if (self.scale - scale).abs() > 0.01 || self.font.is_invalid() {
                 if !self.font.is_invalid() {
                     let _ = DeleteObject(HGDIOBJ(self.font.0));
                 }
                 self.scale = scale;
-                self.font = make_font((12.5 * scale).round() as i32, 600);
+                self.font = make_font((17.0 * scale).round() as i32, 600);
             }
-            self.text = label.to_string();
-            let w = (168.0 * scale).round() as i32;
-            let h = (34.0 * scale).round() as i32;
-            let px = x - w / 2;
-            let py = y - h - (22.0 * scale).round() as i32;
+
+            // 读取当前显示器范围，确保浮窗文字绝不贴边截断
+            let mon = MonitorFromPoint(snap.cursor, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mon_rc = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                mi.rcMonitor
+            } else {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: GetSystemMetrics(SM_CXSCREEN).max(1920),
+                    bottom: GetSystemMetrics(SM_CYSCREEN).max(1080),
+                }
+            };
+
+            let mut min_x = cx;
+            let mut max_x = cx;
+            let mut min_y = cy;
+            let mut max_y = cy;
+            for p in &snap.pts {
+                min_x = min_x.min(p.x);
+                max_x = max_x.max(p.x);
+                min_y = min_y.min(p.y);
+                max_y = max_y.max(p.y);
+            }
+            let stroke_pad = (14.0 * scale).ceil() as i32;
+            min_x -= stroke_pad;
+            min_y -= stroke_pad;
+            max_x += stroke_pad;
+            max_y += stroke_pad;
+
+            let label_info = snap.gesture.map(|g| {
+                let lbl = g.hud_label(swap_lr, launchpad_visible);
+                let _ = self.text_target.ensure_at_least(16, 16);
+                let (tw, th) = self
+                    .text_target
+                    .mem_dc
+                    .map(|dc| measure_text(dc, lbl, self.font))
+                    .unwrap_or((120, 26));
+                let lw = tw + (10.0 * scale).round() as i32;
+                let lh = (th + (8.0 * scale).round() as i32).max((28.0 * scale).round() as i32);
+                let gap = (26.0 * scale).round() as i32;
+                let margin = (12.0 * scale).round() as i32;
+                let lx = if cx + gap + lw <= mon_rc.right - margin {
+                    cx + gap
+                } else {
+                    (cx - gap - lw).max(mon_rc.left + margin)
+                };
+                let ly = (cy - lh / 2)
+                    .clamp(mon_rc.top + margin, (mon_rc.bottom - lh - margin).max(mon_rc.top + margin));
+                (
+                    lbl,
+                    RECT {
+                        left: lx,
+                        top: ly,
+                        right: lx + lw,
+                        bottom: ly + lh,
+                    },
+                )
+            });
+
+            if let Some((_, ref lr)) = label_info {
+                min_x = min_x.min(lr.left - 4);
+                min_y = min_y.min(lr.top - 4);
+                max_x = max_x.max(lr.right + 4);
+                max_y = max_y.max(lr.bottom + 4);
+            }
+
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
+            let win_l = min_x.max(vx);
+            let win_t = min_y.max(vy);
+            let win_r = max_x.min(vx + vw);
+            let win_b = max_y.min(vy + vh);
+            let need_w = (win_r - win_l).max(1);
+            let need_h = (win_b - win_t).max(1);
+            if !self.target.ensure_at_least(need_w, need_h) {
+                return;
+            }
+            let Some(dc) = self.target.mem_dc else { return };
+            let Some(mut sf) = self.target.surface() else { return };
+            sf.clear_rect_transparent(need_w, need_h);
+
+            let local_pts: Vec<(f32, f32)> = snap
+                .pts
+                .iter()
+                .map(|p| ((p.x - win_l) as f32, (p.y - win_t) as f32))
+                .collect();
+            let stroke_w = (4.2 * scale).max(2.6);
+            // 亮青蓝色实时轨迹与浮动标签（复刻 Quicker 视觉）
+            let cyan = rgb(0x00AEFF, 0.96);
+            draw_gesture_trail(
+                &mut sf,
+                &local_pts,
+                stroke_w,
+                cyan,
+                need_w,
+                need_h,
+                &mut self.cov_buf,
+            );
+            if let Some((lbl, lr)) = label_info {
+                let local_rc = RECT {
+                    left: lr.left - win_l,
+                    top: lr.top - win_t,
+                    right: lr.right - win_l,
+                    bottom: lr.bottom - win_t,
+                };
+                draw_transparent_text(
+                    &mut sf,
+                    &mut self.text_target,
+                    lbl,
+                    self.font,
+                    &local_rc,
+                    rgb(0x00AEFF, 1.0),
+                    scale,
+                );
+            }
+
+            let dst_pt = POINT { x: win_l, y: win_t };
+            let dst_sz = SIZE { cx: need_w, cy: need_h };
+            let src_pt = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&dst_pt),
+                Some(&dst_sz),
+                dc,
+                Some(&src_pt),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            if !self.visible {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                self.visible = true;
+            }
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                px,
-                py.max(8),
-                w,
-                h,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
-            let _ = InvalidateRect(self.hwnd, None, false);
         }
     }
 
     fn hide(&mut self) {
-        if !self.hwnd.is_invalid() {
+        if self.visible && !self.hwnd.is_invalid() {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
-            self.target.release();
+            self.visible = false;
         }
+        self.target.release();
+        self.text_target.release();
+        self.cov_buf.clear();
+        self.cov_buf.shrink_to_fit();
     }
 
-    fn paint(&mut self) {
-        let mut rc = RECT::default();
+    fn destroy(&mut self) {
+        self.hide();
         unsafe {
-            let _ = GetClientRect(self.hwnd, &mut rc);
-        }
-        let w = (rc.right - rc.left).max(1);
-        let h = (rc.bottom - rc.top).max(1);
-        if !self.target.ensure(w, h) {
-            return;
-        }
-        let Some(dc) = self.target.mem_dc else { return };
-        let Some(mut sf) = self.target.surface() else { return };
-        let s = self.scale;
-        sf.clear(rgb(0x181C24, 1.0));
-        sf.stroke_rrect(&RECT { left: 0, top: 0, right: w, bottom: h }, 8.0 * s, 1.0, rgb(0x3B82F6, 0.7));
-        draw_text(dc, &self.text, self.font, &RECT { left: 8, top: 0, right: w - 8, bottom: h }, rgb(0xF8FAFC, 1.0), TextAlign::Center, true, false);
-        unsafe {
-            let mut ps = PAINTSTRUCT::default();
-            let wdc = BeginPaint(self.hwnd, &mut ps);
-            let _ = BitBlt(wdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
-            let _ = EndPaint(self.hwnd, &mut ps);
+            if !self.hwnd.is_invalid() {
+                let _ = DestroyWindow(self.hwnd);
+                self.hwnd = HWND::default();
+            }
+            if !self.font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+                self.font = HFONT::default();
+            }
         }
     }
 }
 
-unsafe extern "system" fn hud_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_NCCREATE {
-        let cs = lparam.0 as *const CREATESTRUCTW;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*cs).lpCreateParams as isize);
-    }
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GestureHud;
-    if ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    let hud = &mut *ptr;
+unsafe extern "system" fn overlay_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
+        WM_NCHITTEST => LRESULT(-1), // HTTRANSPARENT：彻底穿透鼠标事件
         WM_ERASEBKGND => LRESULT(1),
-        WM_PAINT => {
-            hud.paint();
-            LRESULT(0)
-        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -237,20 +403,25 @@ pub struct App {
     pub menu_target: Option<usize>,
     pub taskbar_created_msg: u32,
     pub gesture: Option<gesture::GestureHandle>,
-    gesture_hud: GestureHud,
+    gesture_overlay: GestureOverlay,
     pub settings_hwnd: HWND,
     pub add_hwnd: HWND,
     pub exiting: bool,
+    // 开合淡入与高精度动画时钟状态
+    fade_start: Option<Instant>,
+    hi_res_timer: bool,
     // 水平滑动翻页状态
     drag_active: bool,
     drag_moved: bool,
     drag_start_x: i32,
     drag_start_y: i32,
-    drag_last_x: i32,
-    drag_last_time: Instant,
-    drag_vx: f32,
+    drag_origin_x: i32,
+    drag_base_x: f32,
+    drag_samples: VecDeque<(i32, Instant)>,
     slide_x: f32,
-    slide_anim: Option<(f32, Instant)>,
+    slide_vx: f32,
+    slide_anim: bool,
+    slide_last_time: Instant,
     slide_neighbor: Option<(usize, i32)>,
     // 100ms Tooltip 状态
     tip_pending: Option<(TipTarget, RECT, String)>,
@@ -319,19 +490,23 @@ impl App {
             menu_target: None,
             taskbar_created_msg,
             gesture: None,
-            gesture_hud: GestureHud::new(),
+            gesture_overlay: GestureOverlay::new(),
             settings_hwnd: HWND::default(),
             add_hwnd: HWND::default(),
             exiting: false,
+            fade_start: None,
+            hi_res_timer: false,
             drag_active: false,
             drag_moved: false,
             drag_start_x: 0,
             drag_start_y: 0,
-            drag_last_x: 0,
-            drag_last_time: Instant::now(),
-            drag_vx: 0.0,
+            drag_origin_x: 0,
+            drag_base_x: 0.0,
+            drag_samples: VecDeque::with_capacity(16),
             slide_x: 0.0,
-            slide_anim: None,
+            slide_vx: 0.0,
+            slide_anim: false,
+            slide_last_time: Instant::now(),
             slide_neighbor: None,
             tip_pending: None,
             tip_visible: None,
@@ -409,8 +584,10 @@ impl App {
         self.selected = None;
         self.hover = None;
         self.slide_x = 0.0;
-        self.slide_anim = None;
+        self.slide_vx = 0.0;
+        self.slide_anim = false;
         self.slide_neighbor = None;
+        self.sync_hi_res_timer();
         self.clamp_page();
         self.position_edit();
         self.request_page_icons();
@@ -471,11 +648,17 @@ impl App {
         }
     }
 
-    pub fn request_page_icons(&mut self) {
+    /// 优先加载当前可视页图标，确保启动台首帧零阻塞立即呈现。
+    pub fn request_current_page_icons(&mut self) {
         let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
         for item in self.page_items() {
             self.ensure_icon_loaded(&item.key, size);
         }
+    }
+
+    /// 预取左右相邻页图标，保证滑动翻页瞬间即可显示。
+    pub fn prefetch_neighbor_icons(&mut self) {
+        let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
         if self.page + 1 < self.pages() {
             for item in self.items_for_page(self.page + 1) {
                 self.ensure_icon_loaded(&item.key, size);
@@ -486,6 +669,11 @@ impl App {
                 self.ensure_icon_loaded(&item.key, size);
             }
         }
+    }
+
+    pub fn request_page_icons(&mut self) {
+        self.request_current_page_icons();
+        self.prefetch_neighbor_icons();
     }
 
     pub fn request_icon_async(&mut self, key: &str) {
@@ -751,11 +939,25 @@ impl App {
         }
     }
 
+    /// 仅在淡入或滑页动画进行期间申请 1ms 系统时钟精度，空闲时立即归还以保持零功耗。
+    fn sync_hi_res_timer(&mut self) {
+        let need = self.visible && (self.fading || self.slide_anim);
+        if need != self.hi_res_timer {
+            self.hi_res_timer = need;
+            unsafe {
+                if need {
+                    timeBeginPeriod(1);
+                } else {
+                    timeEndPeriod(1);
+                }
+            }
+        }
+    }
+
     pub fn show(&mut self) {
         if self.exiting {
             return;
         }
-        self.ensure_wallpaper_async();
         unsafe {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -781,6 +983,27 @@ impl App {
             );
             self.sync_edit_font();
             self.refresh_search_brush();
+            self.renderer.ensure_target(self.hwnd, w as u32, h as u32, self.scale);
+            self.visible = true;
+            self.alpha = 0;
+            self.fading = false;
+            self.fade_start = None;
+            self.slide_x = 0.0;
+            self.slide_vx = 0.0;
+            self.slide_anim = false;
+            self.slide_neighbor = None;
+            self.context_menu = None;
+            self.tip_pending = None;
+            self.tip_visible = None;
+            self.selected = None;
+            self.hover = None;
+            self.pressed = None;
+            self.pressed_cell = None;
+            self.clamp_page();
+            self.request_current_page_icons();
+
+            // 先置全透明并同步绘完首帧，再以时间基准缓动淡入，彻底消除打开瞬间的卡顿与跳帧
+            let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), 0, LWA_ALPHA);
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
@@ -791,25 +1014,14 @@ impl App {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             self.position_edit();
-            let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), 0, LWA_ALPHA);
-            self.renderer.ensure_target(self.hwnd, w as u32, h as u32, self.scale);
-            self.visible = true;
-            self.alpha = 0;
-            self.fading = true;
-            self.slide_x = 0.0;
-            self.slide_anim = None;
-            self.slide_neighbor = None;
-            self.context_menu = None;
-            self.tip_pending = None;
-            self.tip_visible = None;
-            let _ = SetTimer(self.hwnd, TIMER_FADE, 15, None);
-            self.selected = None;
-            self.hover = None;
-            self.pressed = None;
-            self.pressed_cell = None;
-            self.clamp_page();
-            self.request_page_icons();
             self.invalidate();
+            let _ = UpdateWindow(self.hwnd);
+
+            self.fading = true;
+            self.fade_start = Some(Instant::now());
+            self.sync_hi_res_timer();
+            let _ = SetTimer(self.hwnd, TIMER_FADE, 8, None);
+
             self.force_foreground();
             // 抢焦点后再确认一次 HWND_TOPMOST，压住系统任务栏层级
             let _ = SetWindowPos(
@@ -822,6 +1034,8 @@ impl App {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+        self.ensure_wallpaper_async();
+        self.prefetch_neighbor_icons();
     }
 
     fn sync_edit_font(&mut self) {
@@ -889,14 +1103,19 @@ impl App {
                 let _ = ReleaseCapture();
             }
             self.fading = false;
+            self.fade_start = None;
             self.visible = false;
             self.alpha = 255;
             self.context_menu = None;
             self.tip_pending = None;
             self.tip_visible = None;
             self.slide_x = 0.0;
-            self.slide_anim = None;
+            self.slide_vx = 0.0;
+            self.slide_anim = false;
             self.slide_neighbor = None;
+            self.drag_base_x = 0.0;
+            self.drag_samples.clear();
+            self.sync_hi_res_timer();
             let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), 255, LWA_ALPHA);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             if !self.query().is_empty() {
@@ -1114,16 +1333,49 @@ impl App {
             self.slide_neighbor = Some((old, span));
             self.slide_x = -(span as f32);
         }
+        self.slide_vx = 0.0;
         self.request_page_icons();
         self.start_slide_anim();
         self.invalidate_grid();
     }
 
     fn start_slide_anim(&mut self) {
-        self.slide_anim = Some((self.slide_x, Instant::now()));
+        self.slide_anim = true;
+        self.slide_last_time = Instant::now();
+        self.sync_hi_res_timer();
         unsafe {
-            let _ = SetTimer(self.hwnd, TIMER_SLIDE, 10, None);
+            let _ = SetTimer(self.hwnd, TIMER_SLIDE, 8, None);
         }
+    }
+
+    /// 复刻 macOS 边缘渐进橡皮筋阻尼，越拖越重且过零平滑无突变。
+    fn rubber_band(over: f32, span: f32) -> f32 {
+        let d = over.abs();
+        let limit = (span * 0.30).max(120.0);
+        let res = (limit * d) / (limit / 0.45 + d);
+        res.copysign(over)
+    }
+
+    /// 基于近期 85ms 滑动窗口计算精确脱手水平速度，静止超过 45ms 则速度归零防误翻。
+    fn compute_drag_vx(&mut self) -> f32 {
+        let now = Instant::now();
+        while self.drag_samples.len() > 2
+            && now.duration_since(self.drag_samples.front().unwrap().1) > Duration::from_millis(85)
+        {
+            self.drag_samples.pop_front();
+        }
+        let Some(&(last_x, last_t)) = self.drag_samples.back() else {
+            return 0.0;
+        };
+        if now.duration_since(last_t) > Duration::from_millis(45) {
+            return 0.0;
+        }
+        let &(first_x, first_t) = self.drag_samples.front().unwrap();
+        let dt = last_t.duration_since(first_t).as_secs_f32();
+        if dt < 0.002 {
+            return 0.0;
+        }
+        (last_x - first_x) as f32 / dt
     }
 
     fn cancel_tooltip(&mut self) {
@@ -1295,10 +1547,22 @@ impl App {
 
     pub fn apply_gestures(&mut self, enabled: bool) {
         self.settings.gestures_enabled = enabled;
+        if !enabled {
+            self.gesture_overlay.hide();
+        }
         if let Some(g) = &self.gesture {
             g.set_enabled(enabled);
         } else if enabled {
             log::log("手势线程不可用，无法启用手势");
+        }
+    }
+
+    /// 供非提权自有窗口在鼠标移动时触发低级手势钩子自愈检测。
+    pub fn ensure_gesture_alive(&self) {
+        if self.settings.gestures_enabled {
+            if let Some(g) = &self.gesture {
+                g.ensure_alive();
+            }
         }
     }
 
@@ -1307,7 +1571,10 @@ impl App {
             return;
         }
         self.exiting = true;
-        self.gesture_hud.hide();
+        self.fading = false;
+        self.slide_anim = false;
+        self.sync_hi_res_timer();
+        self.gesture_overlay.destroy();
         self.store.save_settings(&self.settings);
         hotkey::unregister(self.hwnd);
         if let Some(t) = &mut self.tray {
@@ -1425,6 +1692,10 @@ impl App {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                self.fading = false;
+                self.slide_anim = false;
+                self.sync_hi_res_timer();
+                self.gesture_overlay.destroy();
                 self.edit_target.release();
                 unsafe {
                     if !self.edit_brush.is_invalid() {
@@ -1436,6 +1707,16 @@ impl App {
                     let _ = PostQuitMessage(0);
                 }
                 LRESULT(0)
+            }
+            WM_POWERBROADCAST_MSG => {
+                if self.settings.gestures_enabled
+                    && matches!(wparam.0, PBT_APMRESUMESUSPEND_WPARAM | PBT_APMRESUMEAUTOMATIC_WPARAM)
+                {
+                    if let Some(g) = &self.gesture {
+                        g.force_reinstall();
+                    }
+                }
+                LRESULT(1)
             }
             WM_CLOSE => {
                 self.hide();
@@ -1500,7 +1781,13 @@ impl App {
             WM_TIMER => {
                 match wparam.0 {
                     TIMER_FADE if self.fading => {
-                        self.alpha = self.alpha.saturating_add(64);
+                        let p = self
+                            .fade_start
+                            .map(|t| (t.elapsed().as_secs_f32() * 1000.0 / FADE_DURATION_MS).clamp(0.0, 1.0))
+                            .unwrap_or(1.0);
+                        let inv = 1.0 - p;
+                        let ease = 1.0 - inv * inv * inv;
+                        self.alpha = (ease * 255.0).round().clamp(0.0, 255.0) as u8;
                         unsafe {
                             let _ = SetLayeredWindowAttributes(
                                 self.hwnd,
@@ -1508,33 +1795,49 @@ impl App {
                                 self.alpha,
                                 LWA_ALPHA,
                             );
-                            if self.alpha >= 255 {
+                            if p >= 1.0 || self.alpha >= 255 {
+                                self.alpha = 255;
                                 self.fading = false;
+                                self.fade_start = None;
                                 let _ = KillTimer(self.hwnd, TIMER_FADE);
                             }
                         }
+                        if !self.fading {
+                            self.sync_hi_res_timer();
+                        }
                     }
                     TIMER_SLIDE => {
-                        if let Some((start_x, t0)) = self.slide_anim {
-                            let elapsed = t0.elapsed().as_secs_f32() * 1000.0;
-                            let p = (elapsed / SLIDE_DURATION_MS).clamp(0.0, 1.0);
-                            let inv = 1.0 - p;
-                            let ease_rem = inv * inv * inv;
-                            self.slide_x = start_x * ease_rem;
-                            if p >= 1.0 || self.slide_x.abs() < 1.0 {
+                        if self.slide_anim {
+                            let now = Instant::now();
+                            let dt = (now - self.slide_last_time).as_secs_f32().clamp(0.001, 0.05);
+                            self.slide_last_time = now;
+                            // 临界阻尼弹簧（ω = 17 rad/s）：零过冲并平滑衔接鼠标脱手初速度
+                            let omega = 17.0f32;
+                            let steps = ((dt / 0.002).ceil() as usize).clamp(1, 25);
+                            let h = dt / steps as f32;
+                            for _ in 0..steps {
+                                let a = -(omega * omega) * self.slide_x - (2.0 * omega) * self.slide_vx;
+                                self.slide_vx += a * h;
+                                self.slide_x += self.slide_vx * h;
+                            }
+                            if self.slide_x.abs() < 0.6 && self.slide_vx.abs() < 15.0 * self.scale {
                                 self.slide_x = 0.0;
-                                self.slide_anim = None;
+                                self.slide_vx = 0.0;
+                                self.slide_anim = false;
                                 self.slide_neighbor = None;
                                 unsafe {
                                     let _ = KillTimer(self.hwnd, TIMER_SLIDE);
                                 }
+                                self.sync_hi_res_timer();
                             }
                         } else {
                             self.slide_x = 0.0;
+                            self.slide_vx = 0.0;
                             self.slide_neighbor = None;
                             unsafe {
                                 let _ = KillTimer(self.hwnd, TIMER_SLIDE);
                             }
+                            self.sync_hi_res_timer();
                         }
                         self.invalidate_grid();
                     }
@@ -1591,23 +1894,18 @@ impl App {
                 LRESULT(0)
             }
             gesture::WM_APP_GESTURE_HUD => {
-                if let Some(g) = Gesture::from_id(wparam.0) {
-                    let x = get_x_lparam(lparam.0);
-                    let y = get_y_lparam(lparam.0);
-                    let lbl = g.hud_label(self.settings.gesture_swap_lr);
-                    self.gesture_hud.show_at(self.hinst, self.hwnd, x, y, lbl);
-                } else {
-                    self.gesture_hud.hide();
-                }
+                let snap = gesture::take_trail_snapshot();
+                self.gesture_overlay
+                    .update(self.hinst, &snap, self.settings.gesture_swap_lr, self.visible);
                 LRESULT(0)
             }
             gesture::WM_APP_GESTURE => {
-                self.gesture_hud.hide();
+                self.gesture_overlay.hide();
                 if let Some(g) = Gesture::from_id(wparam.0) {
                     if g == Gesture::UpDown {
                         self.toggle();
                     } else {
-                        gesture::perform(g, self.settings.gesture_swap_lr);
+                        gesture::perform_async(g, self.settings.gesture_swap_lr);
                     }
                 }
                 LRESULT(0)
@@ -1646,6 +1944,7 @@ impl App {
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                self.ensure_gesture_alive();
                 let pt = POINT {
                     x: get_x_lparam(lparam.0),
                     y: get_y_lparam(lparam.0),
@@ -1662,34 +1961,43 @@ impl App {
                 if self.drag_active {
                     let dx = pt.x - self.drag_start_x;
                     let dy = pt.y - self.drag_start_y;
-                    let thresh = (8.0 * self.scale).round() as i32;
+                    let thresh = (6.0 * self.scale).round() as i32;
                     if !self.drag_moved && dx.abs() >= thresh && dx.abs() >= dy.abs() {
                         self.drag_moved = true;
+                        // 以越过阈值瞬间的坐标为起点，彻底消除拖页起步瞬间的跳变
+                        self.drag_origin_x = pt.x;
                         self.pressed = None;
                         self.pressed_cell = None;
                         self.hover = None;
                         self.hover_btn = None;
-                        self.slide_anim = None;
+                        self.slide_anim = false;
+                        self.slide_vx = 0.0;
                         self.cancel_tooltip();
                         unsafe {
                             let _ = KillTimer(self.hwnd, TIMER_SLIDE);
                         }
+                        self.sync_hi_res_timer();
                         self.request_page_icons();
                     }
                     if self.drag_moved {
                         let now = Instant::now();
-                        let dt = (now - self.drag_last_time).as_secs_f32().max(0.001);
-                        let inst_vx = (pt.x - self.drag_last_x) as f32 / dt;
-                        self.drag_vx = self.drag_vx * 0.5 + inst_vx * 0.5;
-                        self.drag_last_x = pt.x;
-                        self.drag_last_time = now;
+                        self.drag_samples.push_back((pt.x, now));
+                        while self.drag_samples.len() > 2
+                            && now.duration_since(self.drag_samples.front().unwrap().1)
+                                > Duration::from_millis(85)
+                        {
+                            self.drag_samples.pop_front();
+                        }
 
                         let pages = self.pages();
                         let span = self.layout.grid_span_w.max(1);
-                        let mut off = dx as f32;
-                        if (off > 0.0 && self.page == 0) || (off < 0.0 && self.page + 1 >= pages) {
-                            off *= 0.25;
-                        }
+                        let span_f = span as f32;
+                        let raw = self.drag_base_x + (pt.x - self.drag_origin_x) as f32;
+                        let off = if (raw > 0.0 && self.page == 0) || (raw < 0.0 && self.page + 1 >= pages) {
+                            Self::rubber_band(raw, span_f)
+                        } else {
+                            raw.clamp(-span_f, span_f)
+                        };
                         self.slide_x = off;
                         self.slide_neighbor = if off > 0.5 && self.page > 0 {
                             Some((self.page - 1, -span))
@@ -1766,13 +2074,23 @@ impl App {
                     _ => None,
                 };
                 if matches!(hit, Hit::Cell(_) | Hit::Blank) {
+                    // 若在滑页动画途中按下鼠标，立即接管当前偏移量实现零中断抓停
+                    if self.slide_anim {
+                        self.slide_anim = false;
+                        self.slide_vx = 0.0;
+                        unsafe {
+                            let _ = KillTimer(self.hwnd, TIMER_SLIDE);
+                        }
+                        self.sync_hi_res_timer();
+                    }
                     self.drag_active = true;
                     self.drag_moved = false;
                     self.drag_start_x = pt.x;
                     self.drag_start_y = pt.y;
-                    self.drag_last_x = pt.x;
-                    self.drag_last_time = Instant::now();
-                    self.drag_vx = 0.0;
+                    self.drag_origin_x = pt.x;
+                    self.drag_base_x = self.slide_x;
+                    self.drag_samples.clear();
+                    self.drag_samples.push_back((pt.x, Instant::now()));
                     unsafe {
                         let _ = SetCapture(self.hwnd);
                     }
@@ -1797,33 +2115,45 @@ impl App {
                         self.drag_moved = false;
                         let pages = self.pages();
                         let span = self.layout.grid_span_w.max(1);
-                        let dist_thresh = (self.layout.w as f32 * 0.10).max(70.0 * self.scale);
-                        let flick_vx = 420.0 * self.scale;
-                        let go_next = (self.slide_x < -dist_thresh
-                            || (self.drag_vx < -flick_vx && self.slide_x < -16.0 * self.scale))
-                            && self.page + 1 < pages;
-                        let go_prev = (self.slide_x > dist_thresh
-                            || (self.drag_vx > flick_vx && self.slide_x > 16.0 * self.scale))
-                            && self.page > 0;
+                        let span_f = span as f32;
+                        let vx = self.compute_drag_vx().clamp(-6000.0 * self.scale, 6000.0 * self.scale);
+                        let projected = self.slide_x + vx * 0.14;
+                        let dist_thresh = (span_f * 0.25).max(80.0 * self.scale);
+                        let go_next = self.page + 1 < pages
+                            && (self.slide_x < -dist_thresh
+                                || (projected < -dist_thresh && self.slide_x < -12.0 * self.scale));
+                        let go_prev = self.page > 0
+                            && (self.slide_x > dist_thresh
+                                || (projected > dist_thresh && self.slide_x > 12.0 * self.scale));
                         if go_next {
                             let old = self.page;
                             self.page += 1;
                             self.selected = None;
                             self.slide_neighbor = Some((old, -span));
-                            self.slide_x += span as f32;
+                            self.slide_x += span_f;
                             self.request_page_icons();
                         } else if go_prev {
                             let old = self.page;
                             self.page -= 1;
                             self.selected = None;
                             self.slide_neighbor = Some((old, span));
-                            self.slide_x -= span as f32;
+                            self.slide_x -= span_f;
                             self.request_page_icons();
                         }
+                        self.slide_vx = vx;
+                        self.drag_base_x = 0.0;
                         self.start_slide_anim();
-                        self.invalidate();
+                        self.invalidate_grid();
+                        return LRESULT(0);
+                    } else if self.drag_base_x.abs() > 8.0 * self.scale {
+                        // 中途抓停滑页但未再拖动时松开，直接平滑归位而不触发点击空白关闭
+                        self.drag_base_x = 0.0;
+                        self.pressed = None;
+                        self.pressed_cell = None;
+                        self.start_slide_anim();
                         return LRESULT(0);
                     }
+                    self.drag_base_x = 0.0;
                 }
 
                 let page_count = self.page_items().len();
@@ -1855,6 +2185,7 @@ impl App {
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
+                self.ensure_gesture_alive();
                 let pt = POINT {
                     x: get_x_lparam(lparam.0),
                     y: get_y_lparam(lparam.0),
