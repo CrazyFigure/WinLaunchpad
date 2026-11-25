@@ -1,5 +1,6 @@
 //! 关于页：版本信息、更新操作与可独立展开的离线发布日志。
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::{mpsc, OnceLock};
 
@@ -9,7 +10,8 @@ use windows::Win32::Graphics::Gdi::{IntersectClipRect, RestoreDC, SaveDC, HDC};
 
 use super::{inside, Dlg, Hit};
 use crate::ui::{
-    draw_app_badge, draw_button, draw_scrollbar, draw_text, rgb, BtnStyle, Surface, TextAlign,
+    draw_app_badge, draw_button, draw_scrollbar, draw_text, rgb, BtnStyle, ColorTextRenderer,
+    Rgba, Surface, TextAlign,
 };
 use crate::update::{self, Channel, Release};
 
@@ -54,6 +56,14 @@ enum Outcome {
 }
 
 #[derive(Default)]
+enum ColorTextCache {
+    #[default]
+    Uninit,
+    Ready(ColorTextRenderer),
+    Unavailable,
+}
+
+#[derive(Default)]
 pub(super) struct State {
     release: Option<Release>,
     pending: Option<mpsc::Receiver<Outcome>>,
@@ -62,9 +72,35 @@ pub(super) struct State {
     restarting: bool,
     expanded: HashSet<usize>,
     scroll: i32,
+    color_text: RefCell<ColorTextCache>,
 }
 
 impl State {
+    /// 在滚动裁剪区内使用 Direct2D 彩色字体绘制日志项，失败时返回 false 回退 GDI。
+    fn draw_color_items(
+        &self,
+        dc: HDC,
+        clip: &RECT,
+        px: i32,
+        color: Rgba,
+        items: &[(RECT, &str)],
+    ) -> bool {
+        if items.is_empty() {
+            return true;
+        }
+        let mut cache = self.color_text.borrow_mut();
+        if matches!(*cache, ColorTextCache::Uninit) {
+            *cache = match ColorTextRenderer::new() {
+                Ok(renderer) => ColorTextCache::Ready(renderer),
+                Err(_) => ColorTextCache::Unavailable,
+            };
+        }
+        match &mut *cache {
+            ColorTextCache::Ready(renderer) => renderer.draw_lines(dc, clip, px, color, items),
+            _ => false,
+        }
+    }
+
     fn action(&self) -> Option<Action> {
         if self.pending.is_some() || self.restarting {
             return None;
@@ -455,6 +491,7 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
     }
     sf.set_clip(Some(rc));
     let mut top = rc.top - offset;
+    let mut color_items: Vec<(RECT, &str)> = Vec::new();
     for (index, note) in notes().iter().enumerate() {
         let row = RECT {
             top,
@@ -527,26 +564,35 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
                 top += p(22);
                 for item in &section.items {
                     let item_rc = RECT { top, ..row };
-                    sf.fill_circle(
-                        (row.left + p(34)) as f32,
-                        (top + p(10)) as f32,
-                        1.7 * s,
-                        muted,
-                    );
-                    draw_text(
-                        dc,
-                        item,
-                        dlg.font_body,
-                        &region(item_rc, 44, 0, 12, 20),
-                        muted,
-                        TextAlign::Left,
-                        true,
-                        false,
-                    );
+                    let text_rc = region(item_rc, 44, 0, 12, 20);
+                    if top < rc.bottom && text_rc.bottom > rc.top {
+                        sf.fill_circle(
+                            (row.left + p(34)) as f32,
+                            (top + p(10)) as f32,
+                            1.7 * s,
+                            muted,
+                        );
+                        color_items.push((text_rc, item.as_str()));
+                    }
                     top += p(20);
                 }
             }
             top += p(8);
+        }
+    }
+    // 批量绘制日志彩色 Emoji 条目，保持滚动区裁剪并保留 GDI 回退路径。
+    if !state.draw_color_items(dc, &rc, p(13), muted, &color_items) {
+        for (text_rc, item) in color_items {
+            draw_text(
+                dc,
+                item,
+                dlg.font_body,
+                &text_rc,
+                muted,
+                TextAlign::Left,
+                true,
+                false,
+            );
         }
     }
     sf.set_clip(None);

@@ -1577,7 +1577,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     sf.fill_rect(&footer_bg, rgb(0xFAFAFC, 1.0));
     sf.fill_rect(&RECT { left: l.sidebar_w + 1, top: l.h - l.footer_h, right: l.w, bottom: l.h - l.footer_h + 1 }, rgb(0xE5E7EB, 1.0));
     if dlg.tab != Tab::About {
-        let rescan_label = if app.scanning { "正在扫描…" } else { "重新扫描应用" };
+        let rescan_label = if app.scanning { "正在刷新" } else { "刷新应用图标" };
         draw_button(&mut sf, dc, &l.rescan_btn, rescan_label, dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::Rescan, dlg.pressed == Hit::Rescan, s);
         draw_button(&mut sf, dc, &l.expired_btn, "检测过期图标", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::CheckExpired, dlg.pressed == Hit::CheckExpired, s);
     }
@@ -1697,7 +1697,7 @@ fn paint_tab_general(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     sf.fill_rrect(&l.hk_badge, 8.0 * s, badge_bg);
     sf.stroke_rrect(&l.hk_badge, 8.0 * s, (1.2 * s).max(1.0), badge_bd);
     let hk_str = if dlg.capture_hk {
-        dlg.hk_msg.clone().unwrap_or_else(|| "请按下组合键…（Esc 取消）".into())
+        dlg.hk_msg.clone().unwrap_or_else(|| "请按下组合键（Esc 取消）".into())
     } else {
         app.hotkey.display()
     };
@@ -2184,7 +2184,7 @@ fn paint_tab_refresh(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     sf.fill_circle(dot_cx, dot_cy, 4.2 * s, dot_col);
 
     let status_text = if app.scanning {
-        "正在扫描应用…".to_string()
+        "正在扫描应用".to_string()
     } else if !app.last_scan_time_text.is_empty() {
         match app.last_scan_kind {
             Some(k) => format!("最近扫描：{} · {}", app.last_scan_time_text, k.label()),
@@ -2412,7 +2412,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 .unwrap_or_default();
                 if !dlg.search_edit.is_invalid() {
                     // EM_SETCUEBANNER = 0x1501
-                    let cue = wide("筛选应用或文件夹…");
+                    let cue = wide("筛选应用或文件夹");
                     let _ = SendMessageW(dlg.search_edit, 0x1501, WPARAM(1), LPARAM(cue.as_ptr() as isize));
                 }
                 dlg.rebuild_fonts();

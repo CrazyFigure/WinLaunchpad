@@ -997,7 +997,7 @@ impl Renderer {
                 } else {
                     C_TEXT
                 };
-                draw_text(dc, item.label, self.fonts.menu, &tr, tc, TextAlign::Left, true, false);
+                draw_text(dc, item.label, self.fonts.menu, &tr, tc, TextAlign::Left, false, false);
             }
         }
 

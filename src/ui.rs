@@ -5,10 +5,26 @@
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    D2D1_DRAW_TEXT_OPTIONS, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
-    GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, HDC, HFONT, HGDIOBJ, TRANSPARENT,
+    GdiFlush, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, HDC, HFONT, HGDIOBJ, TRANSPARENT,
 };
 
 pub type Rgba = (f32, f32, f32, f32);
@@ -1058,6 +1074,157 @@ pub fn measure_text(dc: HDC, s: &str, font: HFONT) -> (i32, i32) {
     (sz.cx, sz.cy)
 }
 
+/// 基于 Direct2D / DirectWrite 的单行彩色文本渲染器。
+/// GDI `DrawTextW` 不支持彩色字体表（COLR），会回退为黑白线框字形；
+/// 启用 `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` 后可在现有 DIB DC 上直接渲染原生彩色 Emoji。
+pub struct ColorTextRenderer {
+    d2d: ID2D1Factory,
+    dwrite: IDWriteFactory,
+    rt: ID2D1DCRenderTarget,
+    brush: ID2D1SolidColorBrush,
+    cached_fmt: Option<(i32, IDWriteTextFormat, IDWriteInlineObject)>,
+}
+
+impl ColorTextRenderer {
+    /// 创建可绑定 GDI HDC 的 Direct2D 渲染目标与 DirectWrite 文字工厂。
+    pub fn new() -> windows::core::Result<Self> {
+        unsafe {
+            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let (rt, brush) = Self::create_target_and_brush(&d2d)?;
+            Ok(Self {
+                d2d,
+                dwrite,
+                rt,
+                brush,
+                cached_fmt: None,
+            })
+        }
+    }
+
+    unsafe fn create_target_and_brush(
+        d2d: &ID2D1Factory,
+    ) -> windows::core::Result<(ID2D1DCRenderTarget, ID2D1SolidColorBrush)> {
+        // 使用 96 DPI 与 DIB 像素坐标 1:1 映射，alphaMode 设为 IGNORE 以直接合成到不透明窗口表面。
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let rt = d2d.CreateDCRenderTarget(&props)?;
+        let brush = rt.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+        Ok((rt, brush))
+    }
+
+    /// 缓存指定像素字号的单行居中、末尾省略号格式。
+    unsafe fn text_format(&mut self, px: i32) -> windows::core::Result<&IDWriteTextFormat> {
+        let px = px.max(9);
+        let needs_rebuild = !matches!(self.cached_fmt, Some((cur, _, _)) if cur == px);
+        if needs_rebuild {
+            let fmt = self.dwrite.CreateTextFormat(
+                w!("Microsoft YaHei UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                px as f32,
+                w!("zh-CN"),
+            )?;
+            fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let sign = self.dwrite.CreateEllipsisTrimmingSign(&fmt)?;
+            let trimming = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            fmt.SetTrimming(&trimming, &sign)?;
+            self.cached_fmt = Some((px, fmt, sign));
+        }
+        Ok(&self.cached_fmt.as_ref().expect("format cached").1)
+    }
+
+    /// 在裁剪区 `clip` 内批量绘制带彩色 Emoji 的单行文本；若渲染目标失效则返回 false 供调用方回退 GDI。
+    pub fn draw_lines(
+        &mut self,
+        dc: HDC,
+        clip: &RECT,
+        px: i32,
+        c: Rgba,
+        items: &[(RECT, &str)],
+    ) -> bool {
+        if items.is_empty() || clip.right <= clip.left || clip.bottom <= clip.top {
+            return true;
+        }
+        unsafe {
+            // 先刷新前置 GDI/DIB 绘制，确保 BindDC 读取到最新背景像素。
+            let _ = GdiFlush();
+            if self.rt.BindDC(dc, clip).is_err() {
+                if let Ok((rt, brush)) = Self::create_target_and_brush(&self.d2d) {
+                    self.rt = rt;
+                    self.brush = brush;
+                }
+                if self.rt.BindDC(dc, clip).is_err() {
+                    return false;
+                }
+            }
+            let dwrite = self.dwrite.clone();
+            let Ok(fmt) = self.text_format(px).cloned() else {
+                return false;
+            };
+            self.brush.SetColor(&D2D1_COLOR_F {
+                r: c.0,
+                g: c.1,
+                b: c.2,
+                a: c.3,
+            });
+            let opts = D2D1_DRAW_TEXT_OPTIONS(
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT.0 | D2D1_DRAW_TEXT_OPTIONS_CLIP.0,
+            );
+            self.rt.BeginDraw();
+            for (rc, text) in items {
+                if text.is_empty() || rc.right <= rc.left || rc.bottom <= rc.top {
+                    continue;
+                }
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                let max_w = (rc.right - rc.left) as f32;
+                let max_h = (rc.bottom - rc.top) as f32;
+                if let Ok(layout) = dwrite.CreateTextLayout(&utf16, &fmt, max_w, max_h) {
+                    // BindDC 将渲染目标原点映射到 clip 左上角，需把坐标平移到 clip 局部空间。
+                    let origin = D2D_POINT_2F {
+                        x: (rc.left - clip.left) as f32,
+                        y: (rc.top - clip.top) as f32,
+                    };
+                    self.rt.DrawTextLayout(origin, &layout, &self.brush, opts);
+                }
+            }
+            if self.rt.EndDraw(None, None).is_err() {
+                if let Ok((rt, brush)) = Self::create_target_and_brush(&self.d2d) {
+                    self.rt = rt;
+                    self.brush = brush;
+                }
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// 现代复选框绘制（支持选中、半选、未选及 Hover/Active 状态）。
 pub fn draw_checkbox(
     surface: &mut Surface,
@@ -1691,5 +1858,44 @@ mod tests {
         // 左上角圆角区域内部应带蓝色渐变分量
         let tl = buf[40 * w + 40];
         assert!((tl & 0xFF) > ((tl >> 16) & 0xFF));
+    }
+
+    #[test]
+    fn color_text_renderer_draws_colored_emoji_pixels() {
+        let mut target = DibTarget::default();
+        assert!(target.ensure(360, 48));
+        if let Some(mut sf) = target.surface() {
+            sf.clear(rgb(0xFFFFFF, 1.0));
+        }
+        let dc = target.mem_dc.expect("测试 DIB DC 应已创建");
+        let mut renderer = ColorTextRenderer::new().expect("Direct2D 彩色文本渲染器应创建成功");
+        let clip = RECT { left: 0, top: 0, right: 360, bottom: 48 };
+        let text_rc = RECT { left: 8, top: 8, right: 352, bottom: 40 };
+        let ok = renderer.draw_lines(
+            dc,
+            &clip,
+            20,
+            rgb(0x52647D, 1.0),
+            &[(text_rc, "📦 🚀 🎨 ✨ 测试")],
+        );
+        assert!(ok, "Direct2D 彩色文本渲染应返回成功");
+
+        let slice = unsafe {
+            std::slice::from_raw_parts(target.ptr as *const u32, (target.w * target.h) as usize)
+        };
+        // 前景色 #52647D 满足 R < B；若出现明显的暖色像素（R - B > 30），则证明 Emoji 已按彩色字形输出。
+        let warm_colored_pixels = slice
+            .iter()
+            .filter(|&&px| {
+                let r = ((px >> 16) & 0xFF) as i32;
+                let b = (px & 0xFF) as i32;
+                r - b > 30
+            })
+            .count();
+        assert!(
+            warm_colored_pixels > 20,
+            "期望渲染出彩色 Emoji 像素，实际暖色像素数: {warm_colored_pixels}"
+        );
+        target.release();
     }
 }

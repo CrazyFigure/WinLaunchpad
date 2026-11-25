@@ -1748,9 +1748,9 @@ impl App {
             }
             items.push(ContextItem { cmd: ContextCmd::Remove, label: "从启动台移除", danger: true });
         } else {
-            items.push(ContextItem { cmd: ContextCmd::Add, label: "添加应用…", danger: false });
-            items.push(ContextItem { cmd: ContextCmd::Rescan, label: "重新扫描应用", danger: false });
-            items.push(ContextItem { cmd: ContextCmd::Settings, label: "设置…", danger: false });
+            items.push(ContextItem { cmd: ContextCmd::Add, label: "添加应用", danger: false });
+            items.push(ContextItem { cmd: ContextCmd::Rescan, label: "刷新应用图标", danger: false });
+            items.push(ContextItem { cmd: ContextCmd::Settings, label: "设置", danger: false });
         }
         self.context_menu = Some(ContextMenu::build(
             pt.x,
@@ -1906,7 +1906,7 @@ impl App {
             && (matches!(self.active_scan_kind, ScanKind::Manual | ScanKind::Startup)
                 || self.view.is_empty());
         let status = if show_scanning {
-            "正在扫描已安装的应用…".to_string()
+            "正在扫描已安装的应用".to_string()
         } else if !self.scan.errors.is_empty() {
             format!("{} 个来源读取失败（详见日志）", self.scan.errors.len())
         } else {
@@ -1914,7 +1914,7 @@ impl App {
         };
         let q = self.query();
         let empty_text = if self.scanning && self.view.is_empty() {
-            "正在扫描应用…".to_string()
+            "正在扫描应用".to_string()
         } else if self.view.is_empty() {
             "暂无展示的应用，右键点击可添加或前往设置勾选文件夹".to_string()
         } else if !q.trim().is_empty() {

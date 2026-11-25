@@ -82,7 +82,7 @@ impl Tray {
             let Ok(menu) = CreatePopupMenu() else { return };
             let toggle_label = wide(if visible { "收起启动台" } else { "打开启动台" });
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, PCWSTR(toggle_label.as_ptr()));
-            let _ = AppendMenuW(menu, MF_STRING, CMD_RESCAN as usize, w!("重新扫描应用"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_RESCAN as usize, w!("刷新应用图标"));
             // 托盘菜单仅保留常用操作入口，开机启动统一归入设置页管理
             let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS as usize, w!("设置"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("退出"));
