@@ -1,4 +1,4 @@
-﻿//! 设置窗口：左侧多标签导航（常规设置 / 自动发现文件夹 / 鼠标手势 / 关于），
+﻿//! 设置窗口：左侧多标签导航（常规设置 / 图标管理 / 扫描刷新 / 鼠标手势 / 关于），
 //! 所有修改实时生效并持久化，支持大类分组 + 右侧树形展开管理应用、网格行列与图标档位调节。
 
 mod about;
@@ -319,7 +319,7 @@ impl Dlg {
         let tab_top0 = header_h + s(10.0);
         let tabs = [
             (Tab::General, RECT { left: s(12.0), top: tab_top0, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h }, "常规设置"),
-            (Tab::Folders, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap), right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 2 + tab_gap }, "自动发现文件夹"),
+            (Tab::Folders, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap), right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 2 + tab_gap }, "图标管理"),
             (Tab::Refresh, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 2, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 3 + tab_gap * 2 }, "扫描刷新"),
             (Tab::Gestures, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 3, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 4 + tab_gap * 3 }, "鼠标手势"),
             (Tab::About, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 4, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 5 + tab_gap * 4 }, "关于"),
@@ -1471,7 +1471,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     draw_text(dc, "WinLaunchpad", dlg.font_title, &title_rc, rgb(0x111827, 1.0), TextAlign::Left, true, false);
     let page_title = match dlg.tab {
         Tab::General => "常规设置",
-        Tab::Folders => "自动发现文件夹",
+        Tab::Folders => "图标管理",
         Tab::Refresh => "扫描刷新",
         Tab::Gestures => "鼠标手势",
         Tab::About => "关于 WinLaunchpad",
@@ -1518,8 +1518,6 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
         let rescan_label = if app.scanning { "正在扫描…" } else { "重新扫描应用" };
         draw_button(&mut sf, dc, &l.rescan_btn, rescan_label, dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::Rescan, dlg.pressed == Hit::Rescan, s);
         draw_button(&mut sf, dc, &l.expired_btn, "检测过期图标", dlg.font_btn, BtnStyle::Secondary, dlg.hover == Hit::CheckExpired, dlg.pressed == Hit::CheckExpired, s);
-        let hint_rc = RECT { left: l.expired_btn.right + (12.0 * s) as i32, top: l.h - l.footer_h, right: l.w - (22.0 * s) as i32, bottom: l.h };
-        draw_text(dc, "所有修改实时生效", dlg.font_sub, &hint_rc, rgb(0x94A3B8, 1.0), TextAlign::Right, true, false);
     }
 
     // 右侧内容区
@@ -1660,9 +1658,9 @@ fn paint_tab_general(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
 
     let st_sys_disabled = startup::state() == startup::StartupState::DisabledBySystem;
     let st_label = if st_sys_disabled {
-        "开机自动启动（已被系统任务管理器禁用）"
+        "开机启动（已被系统任务管理器禁用）"
     } else {
-        "随 Windows 登录自动启动"
+        "开机启动"
     };
     let r1_lbl = RECT { left: l.startup_row.left + (18.0 * s) as i32, top: l.startup_row.top, right: l.startup_toggle.left - (12.0 * s) as i32, bottom: l.startup_row.bottom };
     let r2_lbl = RECT { left: l.wallpaper_row.left + (18.0 * s) as i32, top: l.wallpaper_row.top, right: l.wallpaper_toggle.left - (12.0 * s) as i32, bottom: l.wallpaper_row.bottom };

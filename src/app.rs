@@ -1491,7 +1491,7 @@ impl App {
             let name = entry.name.clone();
             self.hide();
             self.show_error(&format!(
-                "找不到「{name}」的目标文件，可能已被卸载。\n可以在设置「应用与文件夹 → 检测过期图标」中清理。"
+                "找不到「{name}」的目标文件，可能已被卸载。\n可以在设置「图标管理 → 检测过期图标」中清理。"
             ));
             return;
         }
@@ -1791,20 +1791,8 @@ impl App {
             tray::CMD_TOGGLE => self.toggle(),
             tray::CMD_RESCAN => self.start_scan(),
             tray::CMD_SETTINGS => crate::settings::open(self),
-            tray::CMD_STARTUP => self.toggle_startup(),
             tray::CMD_EXIT => self.exit(),
             _ => {}
-        }
-    }
-
-    fn toggle_startup(&mut self) {
-        let enable = startup::state() != startup::StartupState::Enabled;
-        match startup::set_enabled(enable) {
-            Ok(_) => {
-                self.settings.start_with_windows = enable;
-                self.store.save_settings(&self.settings);
-            }
-            Err(e) => self.show_error(&e),
         }
     }
 
@@ -1814,8 +1802,7 @@ impl App {
             WM_RBUTTONUP | WM_CONTEXTMENU => {
                 self.in_menu = true;
                 if let Some(t) = &self.tray {
-                    let enabled = startup::state() == startup::StartupState::Enabled;
-                    t.show_menu(enabled, self.visible);
+                    t.show_menu(self.visible);
                 }
                 self.in_menu = false;
             }
