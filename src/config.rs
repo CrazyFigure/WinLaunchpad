@@ -10,6 +10,11 @@ use crate::log;
 
 pub const SETTINGS_VERSION: u32 = 2;
 
+/// 默认启动后首次自动检测更新延迟（10 秒，避免与启动扫描争抢资源）。
+pub const AUTO_UPDATE_STARTUP_DELAY_MS: u32 = 10_000;
+/// 后台自动检测更新默认周期（4 小时）。
+pub const AUTO_UPDATE_INTERVAL_SECS: u64 = 4 * 3600;
+
 fn default_true() -> bool {
     true
 }
@@ -159,6 +164,9 @@ pub struct Settings {
     /// 检测到快捷方式或程序变更时自动更新图标缓存（默认开启）
     #[serde(default = "default_true")]
     pub refresh_changed_icons: bool,
+    /// 是否定时自动检测软件新版本（默认开启）
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
 }
 
 impl Default for Settings {
@@ -183,6 +191,7 @@ impl Default for Settings {
             event_watch_enabled: true,
             scan_on_show: false,
             refresh_changed_icons: true,
+            auto_check_update: true,
         }
     }
 }
@@ -328,6 +337,7 @@ mod tests {
         assert!(s.event_watch_enabled);
         assert!(!s.scan_on_show);
         assert!(s.refresh_changed_icons);
+        assert!(s.auto_check_update);
         assert_eq!(s.gesture_threshold, 70);
     }
 

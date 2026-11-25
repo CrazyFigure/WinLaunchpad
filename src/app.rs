@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -57,11 +57,13 @@ pub const WM_APP_LAUNCH: u32 = WM_APP + 6;
 pub const WM_APP_FOCUS: u32 = WM_APP + 7;
 pub const WM_APP_WALLPAPER: u32 = WM_APP + 8;
 pub const WM_APP_UPDATE_EXIT: u32 = WM_APP + 10;
+pub const WM_APP_AUTO_UPDATE: u32 = WM_APP + 12;
 
 const TIMER_FADE: usize = 1;
 const TIMER_SLIDE: usize = 2;
 const TIMER_TOOLTIP: usize = 3;
 const TIMER_AUTO_SCAN: usize = 4;
+const TIMER_AUTO_UPDATE: usize = 5;
 const SHOW_SCAN_THROTTLE_SECS: u64 = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FADE_DURATION_MS: f32 = 135.0;
@@ -508,6 +510,12 @@ pub struct App {
     last_show_scan_at: Option<Instant>,
     pub settings_hwnd: HWND,
     pub add_hwnd: HWND,
+    pub update_hwnd: HWND,
+    pub available_update: Option<crate::update::UpdateBundle>,
+    auto_updating: bool,
+    auto_notified_version: Option<String>,
+    last_auto_update_at: Option<SystemTime>,
+    pending_update_popup: bool,
     pub exiting: bool,
     // 开合淡入与高精度动画时钟状态
     fade_start: Option<Instant>,
@@ -601,6 +609,12 @@ impl App {
             last_show_scan_at: None,
             settings_hwnd: HWND::default(),
             add_hwnd: HWND::default(),
+            update_hwnd: HWND::default(),
+            available_update: None,
+            auto_updating: false,
+            auto_notified_version: None,
+            last_auto_update_at: None,
+            pending_update_popup: false,
             exiting: false,
             fade_start: None,
             hi_res_timer: false,
@@ -647,6 +661,7 @@ impl App {
         }
         self.rebuild_view();
         self.sync_scan_timer();
+        self.sync_auto_update_timer();
         self.sync_watcher();
         self.start_scan_with(ScanKind::Startup);
         self.ensure_wallpaper_async();
@@ -792,6 +807,12 @@ impl App {
         self.ensure_icon_loaded(key, size);
     }
 
+    /// 打开外部链接或目录前收起启动台，避免置顶窗口与待弹出提醒遮挡新窗口。
+    pub fn dismiss_for_external(&mut self) {
+        self.pending_update_popup = false;
+        self.hide();
+    }
+
     /// 供设置页应用新的图标大小后即时刷新主面板布局。
     pub fn apply_icon_size(&mut self) {
         self.renderer.icons.clear_sprites();
@@ -829,6 +850,124 @@ impl App {
             if !self.exiting && self.settings.scan_interval_secs > 0 {
                 let ms = self.settings.scan_interval_secs.saturating_mul(1000).max(1000);
                 let _ = SetTimer(self.hwnd, TIMER_AUTO_SCAN, ms, None);
+            }
+        }
+    }
+
+    /// 同步后台自动检测更新计时器：开启时启动后延迟检测一次，此后按固定周期轮询。
+    pub fn sync_auto_update_timer(&mut self) {
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_AUTO_UPDATE);
+            if self.exiting || !self.settings.auto_check_update || self.auto_updating {
+                return;
+            }
+            let interval = Duration::from_secs(crate::config::AUTO_UPDATE_INTERVAL_SECS);
+            let startup_delay = crate::config::AUTO_UPDATE_STARTUP_DELAY_MS;
+            let delay_ms = match self.last_auto_update_at {
+                None => startup_delay,
+                Some(last) => match last.elapsed() {
+                    Ok(elapsed) if elapsed >= interval => startup_delay,
+                    Ok(elapsed) => (interval - elapsed)
+                        .as_millis()
+                        .clamp(u128::from(startup_delay), i32::MAX as u128)
+                        as u32,
+                    Err(_) => interval
+                        .as_millis()
+                        .clamp(u128::from(startup_delay), i32::MAX as u128)
+                        as u32,
+                },
+            };
+            let _ = SetTimer(self.hwnd, TIMER_AUTO_UPDATE, delay_ms, None);
+        }
+    }
+
+    /// 在后台线程静默检测是否有新版本；仅在启用自动检测且未在检测中时触发。
+    fn start_auto_update_check(&mut self) {
+        if self.exiting || !self.settings.auto_check_update || self.auto_updating {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_AUTO_UPDATE);
+        }
+        self.auto_updating = true;
+        let hwnd = self.hwnd.0 as isize;
+        let spawn = std::thread::Builder::new()
+            .name("winlaunchpad-auto-update".into())
+            .spawn(move || {
+                let result = crate::update::check();
+                let hwnd = HWND(hwnd as *mut _);
+                unsafe {
+                    let _ = PostMessageW(
+                        hwnd,
+                        WM_APP_AUTO_UPDATE,
+                        WPARAM(0),
+                        LPARAM(Box::into_raw(Box::new(result)) as isize),
+                    );
+                }
+            });
+        if let Err(err) = spawn {
+            self.auto_updating = false;
+            log::log(&format!("启动后台自动检测更新线程失败：{err}"));
+            self.sync_auto_update_timer();
+        }
+    }
+
+    /// 处理后台自动更新检测结果：静默忽略错误，发现新版本时触发弹窗或等待启动台收起后弹出。
+    fn on_auto_update_done(
+        &mut self,
+        result: Result<(Option<crate::update::UpdateBundle>, crate::update::Channel), String>,
+    ) {
+        self.auto_updating = false;
+        self.last_auto_update_at = Some(SystemTime::now());
+        self.sync_auto_update_timer();
+        if self.exiting || !self.settings.auto_check_update {
+            return;
+        }
+        match result {
+            Ok((Some(bundle), _)) => {
+                let version = bundle.latest.version.clone();
+                self.available_update = Some(bundle.clone());
+                unsafe {
+                    if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
+                        let _ = PostMessageW(
+                            self.settings_hwnd,
+                            WM_APP_AUTO_UPDATE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                let popup_open = unsafe {
+                    !self.update_hwnd.is_invalid() && IsWindow(self.update_hwnd).as_bool()
+                };
+                // 同一会话内同一版本仅主动弹窗提醒一次，避免周期检测重复打扰。
+                if self.auto_notified_version.as_deref() != Some(version.as_str()) && !popup_open {
+                    self.auto_notified_version = Some(version);
+                    if self.visible {
+                        self.pending_update_popup = true;
+                    } else {
+                        crate::update_dialog::open(self, bundle);
+                    }
+                }
+            }
+            Ok((None, _)) => {
+                self.available_update = None;
+                unsafe {
+                    if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
+                        let _ = PostMessageW(
+                            self.settings_hwnd,
+                            WM_APP_AUTO_UPDATE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                log::log(&format!("自动检测更新失败：{err}"));
             }
         }
     }
@@ -1428,6 +1567,14 @@ impl App {
             self.edit_target.release();
             self.renderer.release_target();
         }
+        if self.pending_update_popup {
+            self.pending_update_popup = false;
+            if self.settings.auto_check_update {
+                if let Some(bundle) = self.available_update.clone() {
+                    crate::update_dialog::open(self, bundle);
+                }
+            }
+        }
     }
 
     /// 始终保持搜索 EDIT 全宽，防止首字滚动截断并确保鼠标悬停显示竖线光标。
@@ -1866,6 +2013,7 @@ impl App {
         self.sync_hi_res_timer();
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
+            let _ = KillTimer(self.hwnd, TIMER_AUTO_UPDATE);
         }
         if let Some(mut w) = self.watcher.take() {
             w.stop();
@@ -1996,6 +2144,7 @@ impl App {
                 self.sync_hi_res_timer();
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
+                    let _ = KillTimer(self.hwnd, TIMER_AUTO_UPDATE);
                 }
                 if let Some(mut w) = self.watcher.take() {
                     w.stop();
@@ -2022,6 +2171,9 @@ impl App {
                     }
                     if self.settings.event_watch_enabled {
                         self.start_scan_with(ScanKind::Event { uwp_changed: false });
+                    }
+                    if self.settings.auto_check_update {
+                        self.sync_auto_update_timer();
                     }
                 }
                 LRESULT(1)
@@ -2161,6 +2313,9 @@ impl App {
                     TIMER_AUTO_SCAN => {
                         self.start_scan_with(ScanKind::Periodic);
                     }
+                    TIMER_AUTO_UPDATE => {
+                        self.start_auto_update_check();
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -2194,6 +2349,19 @@ impl App {
             WM_APP_UPDATE_EXIT => {
                 // 替换进程就绪后沿用托盘退出流程，确保设置已保存且全局钩子已释放。
                 self.exit();
+                LRESULT(0)
+            }
+            WM_APP_AUTO_UPDATE => {
+                let res = unsafe {
+                    *Box::from_raw(
+                        lparam.0
+                            as *mut Result<
+                                (Option<crate::update::UpdateBundle>, crate::update::Channel),
+                                String,
+                            >,
+                    )
+                };
+                self.on_auto_update_done(res);
                 LRESULT(0)
             }
             WM_APP_CMD => {

@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{App, WM_APP_SCAN, WM_APP_UPDATE_EXIT};
+use crate::app::{App, WM_APP_AUTO_UPDATE, WM_APP_SCAN, WM_APP_UPDATE_EXIT};
 use crate::catalog::{self, AppEntry, ExpiredItem};
 use crate::config::{
     clamp_gesture_threshold, snap_icon_size_dp, snap_scan_interval_secs, DEFAULT_GESTURE_THRESHOLD,
@@ -1142,7 +1142,7 @@ impl Dlg {
                 }
             }
             Tab::About => {
-                if let Some(action) = l.about.hit(&self.about, x, y) {
+                if let Some(action) = l.about.hit(&self.about, self.target.mem_dc, self.font_body, x, y) {
                     return Hit::About(action);
                 }
             }
@@ -1196,7 +1196,11 @@ pub fn open(app: &mut App) {
             expired_list: Vec::new(),
             expired_scroll: 0,
             expired_status: None,
-            about: about::State::default(),
+            about: {
+                let mut about = about::State::default();
+                about.sync_available(app.available_update.as_ref());
+                about
+            },
             hover: Hit::None,
             pressed: Hit::None,
             tip_pending: None,
@@ -1588,7 +1592,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
         Tab::Folders => paint_tab_folders(dlg, app, &l, &mut sf, dc, s),
         Tab::Refresh => paint_tab_refresh(dlg, app, &l, &mut sf, dc, s),
         Tab::Gestures => paint_tab_gestures(dlg, app, &l, &mut sf, dc, s),
-        Tab::About => about::paint(dlg, &l.about, &mut sf, dc),
+        Tab::About => about::paint(dlg, app, &l.about, &mut sf, dc),
     }
 
     // 窗口外框线
@@ -2439,6 +2443,11 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
+            WM_APP_AUTO_UPDATE => {
+                dlg.about.sync_available(app.available_update.as_ref());
+                let _ = InvalidateRect(hwnd, None, false);
+                LRESULT(0)
+            }
             WM_DPICHANGED => {
                 let new = lparam.0 as *const RECT;
                 let r = *new;
@@ -2476,7 +2485,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 } else if wparam.0 == TIMER_UPDATE {
-                    let (done, restart) = dlg.about.poll();
+                    let (done, restart) = dlg.about.poll(&mut app.available_update);
                     if done {
                         let _ = KillTimer(hwnd, TIMER_UPDATE);
                         let _ = InvalidateRect(hwnd, None, false);
@@ -2520,7 +2529,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let l = dlg.layout();
                     let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
-                    if dlg.about.scroll(&l.about, pt.x, pt.y, get_wheel_delta(wparam.0)) {
+                    if dlg.about.scroll(&l.about, dlg.target.mem_dc, dlg.font_body, pt.x, pt.y, get_wheel_delta(wparam.0)) {
                         dlg.hover = dlg.hit_test(&l, pt.x, pt.y);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -2869,10 +2878,37 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             }
                         }
                         Hit::About(action) => match action {
-                            about::Action::Version(index) => dlg.about.toggle(&l.about, index),
-                            about::Action::GitHub => open_shell_path("open", "https://github.com/CrazyFigure/WinLaunchpad", None),
-                            about::Action::Cnb => open_shell_path("open", "https://cnb.cool/crazy-figure/WinLaunchpad", None),
-                            about::Action::DataDir => open_shell_path("open", &app.store.dir.to_string_lossy(), None),
+                            about::Action::Version(index) => {
+                                dlg.about.toggle(&l.about, dlg.target.mem_dc, dlg.font_body, index);
+                            }
+                            about::Action::ToggleAutoUpdate => {
+                                app.settings.auto_check_update = !app.settings.auto_check_update;
+                                app.store.save_settings(&app.settings);
+                                app.sync_auto_update_timer();
+                            }
+                            about::Action::ShowPopup => {
+                                if let Some(bundle) = dlg.about.bundle().cloned() {
+                                    crate::update_dialog::open(app, bundle);
+                                }
+                            }
+                            about::Action::GitHub
+                            | about::Action::Cnb
+                            | about::Action::DataDir => {
+                                let target = match action {
+                                    about::Action::GitHub => {
+                                        "https://github.com/CrazyFigure/WinLaunchpad".to_string()
+                                    }
+                                    about::Action::Cnb => {
+                                        "https://cnb.cool/crazy-figure/WinLaunchpad".to_string()
+                                    }
+                                    _ => app.store.dir.to_string_lossy().into_owned(),
+                                };
+                                // 先收起启动台并关闭置顶设置窗口，避免遮挡新打开的浏览器或资源管理器窗口。
+                                app.dismiss_for_external();
+                                let _ = DestroyWindow(hwnd);
+                                open_shell_path("open", &target, None);
+                                return LRESULT(0);
+                            }
                             about::Action::Check | about::Action::Install => {
                                 // 更新期间清除悬停提示，仅在后台任务存在时轮询。
                                 dlg.tip_pending = None;

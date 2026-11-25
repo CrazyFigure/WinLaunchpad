@@ -17,8 +17,10 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -1074,7 +1076,45 @@ pub fn measure_text(dc: HDC, s: &str, font: HFONT) -> (i32, i32) {
     (sz.cx, sz.cy)
 }
 
-/// 基于 Direct2D / DirectWrite 的单行彩色文本渲染器。
+/// 在 GDI DC 上测量多行自动换行文字的实际高度。
+pub fn measure_wrapped_text_height(dc: HDC, s: &str, font: HFONT, max_w: i32) -> i32 {
+    if s.is_empty() || max_w <= 0 {
+        return 0;
+    }
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: max_w.max(1),
+        bottom: 0,
+    };
+    let fmt = DRAW_TEXT_FORMAT(0x10 | 0x400 | 0x800 | 0x2000); // DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX | DT_EDITCONTROL
+    unsafe {
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let _ = DrawTextW(dc, &mut w, &mut rc, fmt);
+        SelectObject(dc, old);
+    }
+    (rc.bottom - rc.top).max(1)
+}
+
+/// 在 GDI DC 上绘制支持自动换行的多行文字（顶部左对齐）。
+pub fn draw_wrapped_text(dc: HDC, s: &str, font: HFONT, r: &RECT, c: Rgba) {
+    if s.is_empty() || r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    let fmt = DRAW_TEXT_FORMAT(0x10 | 0x800 | 0x2000); // DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL
+    unsafe {
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        SetBkMode(dc, TRANSPARENT);
+        let mut rc = *r;
+        SetTextColor(dc, to_colorref(c));
+        let _ = DrawTextW(dc, &mut w, &mut rc, fmt);
+        SelectObject(dc, old);
+    }
+}
+
+/// 基于 Direct2D / DirectWrite 的彩色文本渲染器。
 /// GDI `DrawTextW` 不支持彩色字体表（COLR），会回退为黑白线框字形；
 /// 启用 `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` 后可在现有 DIB DC 上直接渲染原生彩色 Emoji。
 pub struct ColorTextRenderer {
@@ -1083,6 +1123,7 @@ pub struct ColorTextRenderer {
     rt: ID2D1DCRenderTarget,
     brush: ID2D1SolidColorBrush,
     cached_fmt: Option<(i32, IDWriteTextFormat, IDWriteInlineObject)>,
+    cached_wrap_fmt: Option<(i32, IDWriteTextFormat)>,
 }
 
 impl ColorTextRenderer {
@@ -1098,6 +1139,7 @@ impl ColorTextRenderer {
                 rt,
                 brush,
                 cached_fmt: None,
+                cached_wrap_fmt: None,
             })
         }
     }
@@ -1159,15 +1201,47 @@ impl ColorTextRenderer {
         Ok(&self.cached_fmt.as_ref().expect("format cached").1)
     }
 
-    /// 在裁剪区 `clip` 内批量绘制带彩色 Emoji 的单行文本；若渲染目标失效则返回 false 供调用方回退 GDI。
-    pub fn draw_lines(
-        &mut self,
-        dc: HDC,
-        clip: &RECT,
-        px: i32,
-        c: Rgba,
-        items: &[(RECT, &str)],
-    ) -> bool {
+    /// 缓存指定像素字号的自动换行格式（顶部对齐，防止长更新条目被截断）。
+    unsafe fn wrapped_format(&mut self, px: i32) -> windows::core::Result<&IDWriteTextFormat> {
+        let px = px.max(9);
+        let needs_rebuild = !matches!(self.cached_wrap_fmt, Some((cur, _)) if cur == px);
+        if needs_rebuild {
+            let fmt = self.dwrite.CreateTextFormat(
+                w!("Microsoft YaHei UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                px as f32,
+                w!("zh-CN"),
+            )?;
+            fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)?;
+            fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            self.cached_wrap_fmt = Some((px, fmt));
+        }
+        Ok(&self.cached_wrap_fmt.as_ref().expect("wrap format cached").1)
+    }
+
+    /// 测量多行自动换行文本在给定最大宽度下的像素高度，用于精准计算折叠日志展开高度。
+    pub fn measure_wrapped_height(&mut self, px: i32, max_w: i32, text: &str) -> Option<i32> {
+        if text.is_empty() || max_w <= 0 {
+            return Some(0);
+        }
+        unsafe {
+            let dwrite = self.dwrite.clone();
+            let fmt = self.wrapped_format(px).ok()?.clone();
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let layout = dwrite
+                .CreateTextLayout(&utf16, &fmt, max_w as f32, 10_000.0)
+                .ok()?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics).ok()?;
+            Some(metrics.height.ceil() as i32)
+        }
+    }
+
+    fn draw_batch(&mut self, dc: HDC, clip: &RECT, px: i32, c: Rgba, items: &[(RECT, &str)], wrap: bool) -> bool {
         if items.is_empty() || clip.right <= clip.left || clip.bottom <= clip.top {
             return true;
         }
@@ -1184,7 +1258,12 @@ impl ColorTextRenderer {
                 }
             }
             let dwrite = self.dwrite.clone();
-            let Ok(fmt) = self.text_format(px).cloned() else {
+            let fmt = if wrap {
+                self.wrapped_format(px).cloned()
+            } else {
+                self.text_format(px).cloned()
+            };
+            let Ok(fmt) = fmt else {
                 return false;
             };
             self.brush.SetColor(&D2D1_COLOR_F {
@@ -1222,6 +1301,31 @@ impl ColorTextRenderer {
             }
         }
         true
+    }
+
+    /// 在裁剪区 `clip` 内批量绘制带彩色 Emoji 的单行文本；若渲染目标失效则返回 false 供调用方回退 GDI。
+    #[allow(dead_code)]
+    pub fn draw_lines(
+        &mut self,
+        dc: HDC,
+        clip: &RECT,
+        px: i32,
+        c: Rgba,
+        items: &[(RECT, &str)],
+    ) -> bool {
+        self.draw_batch(dc, clip, px, c, items, false)
+    }
+
+    /// 在裁剪区 `clip` 内批量绘制支持自动换行与彩色 Emoji 的多行文本。
+    pub fn draw_wrapped_lines(
+        &mut self,
+        dc: HDC,
+        clip: &RECT,
+        px: i32,
+        c: Rgba,
+        items: &[(RECT, &str)],
+    ) -> bool {
+        self.draw_batch(dc, clip, px, c, items, true)
     }
 }
 
@@ -1896,6 +2000,25 @@ mod tests {
             warm_colored_pixels > 20,
             "期望渲染出彩色 Emoji 像素，实际暖色像素数: {warm_colored_pixels}"
         );
+
+        let single_h = renderer
+            .measure_wrapped_height(13, 400, "📦 短文本")
+            .unwrap();
+        let multi_h = renderer
+            .measure_wrapped_height(
+                13,
+                120,
+                "📦 这是一段足够长的测试文本用于验证自动换行计算高度确实大于单行高度",
+            )
+            .unwrap();
+        assert!(multi_h > single_h, "期望换行高度 {multi_h} > 单行高度 {single_h}");
+        assert!(renderer.draw_wrapped_lines(
+            dc,
+            &clip,
+            13,
+            rgb(0x52647D, 1.0),
+            &[(text_rc, "🔔 自动换行彩色文本测试")],
+        ));
         target.release();
     }
 }

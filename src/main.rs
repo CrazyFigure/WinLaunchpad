@@ -16,6 +16,7 @@
 mod add;
 mod app;
 mod catalog;
+mod changelog;
 mod config;
 mod gesture;
 mod hotkey;
@@ -28,6 +29,7 @@ mod startup;
 mod tray;
 mod ui;
 mod update;
+mod update_dialog;
 mod wallpaper;
 mod watcher;
 mod win32;

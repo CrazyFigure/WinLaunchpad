@@ -1,47 +1,32 @@
-//! 关于页：版本信息、更新操作与可独立展开的离线发布日志。
+//! 关于页：版本信息、更新操作、自动检测更新开关与可独立展开的离线发布日志。
 
-use std::cell::RefCell;
-use std::collections::HashSet;
 use std::sync::{mpsc, OnceLock};
 
-use serde::Deserialize;
 use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Gdi::{IntersectClipRect, RestoreDC, SaveDC, HDC};
+use windows::Win32::Graphics::Gdi::{HDC, HFONT};
 
 use super::{inside, Dlg, Hit};
-use crate::ui::{
-    draw_app_badge, draw_button, draw_scrollbar, draw_text, rgb, BtnStyle, ColorTextRenderer,
-    Rgba, Surface, TextAlign,
-};
-use crate::update::{self, Channel, Release};
+use crate::app::App;
+use crate::changelog::ChangelogView;
+use crate::ui::{draw_app_badge, draw_button, draw_text, draw_toggle, rgb, BtnStyle, Surface, TextAlign};
+use crate::update::{self, Channel, ReleaseNote, UpdateBundle};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
     Check,
     Install,
+    ShowPopup,
+    ToggleAutoUpdate,
     Version(usize),
     GitHub,
     Cnb,
     DataDir,
 }
 
-#[derive(Deserialize)]
-struct Note {
-    version: String,
-    date: String,
-    sections: Vec<Section>,
-}
-
-#[derive(Deserialize)]
-struct Section {
-    title: String,
-    items: Vec<String>,
-}
-
-fn notes() -> &'static [Note] {
-    static NOTES: OnceLock<Vec<Note>> = OnceLock::new();
+fn notes() -> &'static [ReleaseNote] {
+    static NOTES: OnceLock<Vec<ReleaseNote>> = OnceLock::new();
     NOTES.get_or_init(|| {
-        let mut notes: Vec<Note> =
+        let mut notes: Vec<ReleaseNote> =
             serde_json::from_str(include_str!("../../assets/release-notes.json"))
                 .expect("内置更新日志 JSON 无效");
         // 日志文件按新版在前维护，关于页展示最近十项。
@@ -51,65 +36,50 @@ fn notes() -> &'static [Note] {
 }
 
 enum Outcome {
-    Checked(Result<(Option<Release>, Channel), String>),
+    Checked(Result<(Option<UpdateBundle>, Channel), String>),
     Downloaded(Result<Vec<u8>, String>),
 }
 
 #[derive(Default)]
-enum ColorTextCache {
-    #[default]
-    Uninit,
-    Ready(ColorTextRenderer),
-    Unavailable,
-}
-
-#[derive(Default)]
 pub(super) struct State {
-    release: Option<Release>,
+    bundle: Option<UpdateBundle>,
     pending: Option<mpsc::Receiver<Outcome>>,
     status: String,
     failed: bool,
     restarting: bool,
-    expanded: HashSet<usize>,
-    scroll: i32,
-    color_text: RefCell<ColorTextCache>,
+    changelog: ChangelogView,
 }
 
 impl State {
-    /// 在滚动裁剪区内使用 Direct2D 彩色字体绘制日志项，失败时返回 false 回退 GDI。
-    fn draw_color_items(
-        &self,
-        dc: HDC,
-        clip: &RECT,
-        px: i32,
-        color: Rgba,
-        items: &[(RECT, &str)],
-    ) -> bool {
-        if items.is_empty() {
-            return true;
+    /// 同步后台自动检测或主状态已发现的可安装更新。
+    pub(super) fn sync_available(&mut self, available: Option<&UpdateBundle>) {
+        if self.pending.is_some() || self.restarting {
+            return;
         }
-        let mut cache = self.color_text.borrow_mut();
-        if matches!(*cache, ColorTextCache::Uninit) {
-            *cache = match ColorTextRenderer::new() {
-                Ok(renderer) => ColorTextCache::Ready(renderer),
-                Err(_) => ColorTextCache::Unavailable,
-            };
+        if let Some(bundle) = available {
+            self.bundle = Some(bundle.clone());
+            self.status = format!("发现 v{} · {}", bundle.latest.version, bundle.latest.channel.name());
+            self.failed = false;
         }
-        match &mut *cache {
-            ColorTextCache::Ready(renderer) => renderer.draw_lines(dc, clip, px, color, items),
-            _ => false,
-        }
+    }
+
+    pub(super) fn bundle(&self) -> Option<&UpdateBundle> {
+        self.bundle.as_ref()
     }
 
     fn action(&self) -> Option<Action> {
         if self.pending.is_some() || self.restarting {
             return None;
         }
-        Some(if self.release.is_some() {
+        Some(if self.bundle.is_some() {
             Action::Install
         } else {
             Action::Check
         })
+    }
+
+    fn can_show_popup(&self) -> bool {
+        self.bundle.is_some() && self.pending.is_none() && !self.restarting
     }
 
     /// 网络请求交给后台线程，设置窗口用计时器取回结果。
@@ -118,7 +88,7 @@ impl State {
             return false;
         }
         let (sender, receiver) = mpsc::channel();
-        let release = self.release.clone();
+        let release = self.bundle.as_ref().map(|b| b.latest.clone());
         let spawn = std::thread::Builder::new()
             .name("winlaunchpad-update".into())
             .spawn(move || {
@@ -148,8 +118,8 @@ impl State {
         self.failed = true;
     }
 
-    /// 返回任务是否已结束、是否需要从主窗口执行正常退出。
-    pub(super) fn poll(&mut self) -> (bool, bool) {
+    /// 返回任务是否已结束、是否需要从主窗口执行正常退出，并同步最新的远端可用更新缓存。
+    pub(super) fn poll(&mut self, available: &mut Option<UpdateBundle>) -> (bool, bool) {
         let Some(receiver) = &self.pending else {
             return (true, false);
         };
@@ -159,14 +129,19 @@ impl State {
         }
         self.pending = None;
         match result {
-            Ok(Outcome::Checked(Ok((release, source)))) => {
-                self.status = match &release {
-                    Some(release) => {
-                        format!("发现 v{} · {}", release.version, release.channel.name())
+            Ok(Outcome::Checked(Ok((bundle, source)))) => {
+                self.status = match &bundle {
+                    Some(bundle) => {
+                        format!(
+                            "发现 v{} · {}",
+                            bundle.latest.version,
+                            bundle.latest.channel.name()
+                        )
                     }
                     None => format!("当前已是最新版本 · {}", source.name()),
                 };
-                self.release = release;
+                self.bundle = bundle.clone();
+                *available = bundle;
             }
             Ok(Outcome::Checked(Err(error))) => self.fail("检测失败，请检查网络后重试", &error),
             Ok(Outcome::Downloaded(result)) => {
@@ -184,21 +159,22 @@ impl State {
         (true, false)
     }
 
-    pub(super) fn toggle(&mut self, layout: &Layout, index: usize) {
-        if !self.expanded.insert(index) {
-            self.expanded.remove(&index);
-        }
-        self.scroll = layout.scroll_metrics(self).0;
+    pub(super) fn toggle(&mut self, layout: &Layout, dc: Option<HDC>, font_body: HFONT, index: usize) {
+        self.changelog
+            .toggle(index, notes(), &layout.viewport, dc, font_body, layout.scale);
     }
 
-    pub(super) fn scroll(&mut self, layout: &Layout, x: i32, y: i32, delta: i16) -> bool {
-        if !inside(&layout.viewport, x, y) || delta == 0 {
-            return false;
-        }
-        let (offset, total, visible) = layout.scroll_metrics(self);
-        self.scroll =
-            (offset - i32::from(delta) * layout.px(44) / 120).clamp(0, (total - visible).max(0));
-        true
+    pub(super) fn scroll(
+        &mut self,
+        layout: &Layout,
+        dc: Option<HDC>,
+        font_body: HFONT,
+        x: i32,
+        y: i32,
+        delta: i16,
+    ) -> bool {
+        self.changelog
+            .scroll_by(x, y, delta, notes(), &layout.viewport, dc, font_body, layout.scale)
     }
 }
 
@@ -206,6 +182,9 @@ pub(super) struct Layout {
     hero: RECT,
     update: RECT,
     button: RECT,
+    details_button: RECT,
+    auto_row: RECT,
+    auto_toggle: RECT,
     history: RECT,
     viewport: RECT,
     links: [(Action, RECT, &'static str); 3],
@@ -226,20 +205,44 @@ impl Layout {
             ..footer
         };
         let hero = band(0, 98);
-        let update = band(110, 174);
+        let update = band(110, 218);
+        let button = RECT {
+            left: update.right - s(122),
+            right: update.right - s(16),
+            top: update.top + s(14),
+            bottom: update.top + s(50),
+        };
+        let details_button = RECT {
+            left: button.left - s(8) - s(88),
+            right: button.left - s(8),
+            top: button.top,
+            bottom: button.bottom,
+        };
+        let auto_row = RECT {
+            left: update.left,
+            top: update.top + s(64),
+            right: update.right,
+            bottom: update.bottom,
+        };
+        let tw = s(44);
+        let th = s(24);
+        let auto_toggle = RECT {
+            left: update.right - s(16) - tw,
+            top: auto_row.top + (s(44) - th) / 2,
+            right: update.right - s(16),
+            bottom: auto_row.top + (s(44) + th) / 2,
+        };
         let history = RECT {
-            top: content.top + s(186),
+            top: content.top + s(230),
             ..content
         };
         Self {
             hero,
             update,
-            button: RECT {
-                left: update.right - s(122),
-                right: update.right - s(16),
-                top: update.top + s(14),
-                bottom: update.top + s(50),
-            },
+            button,
+            details_button,
+            auto_row,
+            auto_toggle,
             history,
             viewport: RECT {
                 left: history.left + s(12),
@@ -260,79 +263,49 @@ impl Layout {
         (value as f32 * self.scale).round() as i32
     }
 
-    fn section_height(&self, section: &Section) -> i32 {
-        self.px(22) + self.px(20) * section.items.len() as i32
-    }
-
-    fn detail_height(&self, note: &Note) -> i32 {
-        self.px(8)
-            + note
-                .sections
-                .iter()
-                .map(|section| self.section_height(section))
-                .sum::<i32>()
-    }
-
-    fn scroll_metrics(&self, state: &State) -> (i32, i32, i32) {
-        let total = notes()
-            .iter()
-            .enumerate()
-            .map(|(i, note)| {
-                self.px(38)
-                    + if state.expanded.contains(&i) {
-                        self.detail_height(note)
-                    } else {
-                        0
-                    }
-            })
-            .sum::<i32>();
-        let visible = (self.viewport.bottom - self.viewport.top).max(0);
-        (
-            state.scroll.clamp(0, (total - visible).max(0)),
-            total,
-            visible,
-        )
-    }
-
     /// 命中区与绘制共享位置，并限制在日志可视区内。
-    pub(super) fn hit(&self, state: &State, x: i32, y: i32) -> Option<Action> {
+    pub(super) fn hit(
+        &self,
+        state: &State,
+        dc: Option<HDC>,
+        font_body: HFONT,
+        x: i32,
+        y: i32,
+    ) -> Option<Action> {
         if inside(&self.button, x, y) {
             return state.action();
+        }
+        if state.can_show_popup() && inside(&self.details_button, x, y) {
+            return Some(Action::ShowPopup);
+        }
+        if inside(&self.auto_toggle, x, y) || inside(&self.auto_row, x, y) {
+            return Some(Action::ToggleAutoUpdate);
         }
         if let Some((action, _, _)) = self.links.iter().find(|(_, rect, _)| inside(rect, x, y)) {
             return Some(*action);
         }
-        if !inside(&self.viewport, x, y) {
-            return None;
-        }
-        let (offset, _, _) = self.scroll_metrics(state);
-        let mut top = self.viewport.top - offset;
-        for (index, note) in notes().iter().enumerate() {
-            let bottom = top + self.px(38);
-            if y >= top && y < bottom {
-                return Some(Action::Version(index));
-            }
-            top = bottom
-                + if state.expanded.contains(&index) {
-                    self.detail_height(note)
-                } else {
-                    0
-                };
-        }
-        None
+        state
+            .changelog
+            .hit_version(x, y, notes(), &self.viewport, dc, font_body, self.scale)
+            .map(Action::Version)
     }
 
     pub(super) fn tip(&self, action: Action) -> Option<(RECT, &'static str)> {
         match action {
             Action::Check => Some((self.button, "优先检测 GitHub，连接失败时尝试腾讯云 CNB")),
-            Action::Install => Some((self.button, "验签通过后更新 EXE 并重启 WinLaunchpad")),
+            Action::Install => Some((self.button, "验签通过后安装更新并重启 WinLaunchpad")),
+            Action::ShowPopup => Some((self.details_button, "打开弹窗查看所有未安装版本的更新日志")),
+            Action::ToggleAutoUpdate => Some((
+                self.auto_toggle,
+                "开启后启动时及每 4 小时自动后台检测新版本，发现更新时弹窗提示",
+            )),
             Action::DataDir => Some((self.links[2].1, "打开设置、缓存与运行日志所在目录")),
             _ => None,
         }
     }
 }
 
-pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
+pub(super) fn paint(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) {
     let s = l.scale;
     let p = |dp| l.px(dp);
     let primary = rgb(0x17253D, 1.0);
@@ -386,19 +359,34 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
         false,
     );
 
-    // 更新状态和主按钮保持在同一视线，后台任务期间按钮变为不可操作。
+    // 更新状态、主按钮与自动检测更新开关集中在同一卡片内
+    sf.fill_rrect(&l.update, 12.0 * s, rgb(0xF8FAFC, 1.0));
     sf.stroke_rrect(&l.update, 12.0 * s, s.max(1.0), border);
+    if dlg.hover == Hit::About(Action::ToggleAutoUpdate) {
+        sf.fill_rrect(&l.auto_row, 10.0 * s, rgb(0xF1F5F9, 0.7));
+    }
+    sf.fill_rect(
+        &RECT {
+            left: l.update.left + p(16),
+            top: l.auto_row.top,
+            right: l.update.right - p(16),
+            bottom: l.auto_row.top + 1,
+        },
+        border,
+    );
+
+    let state = &dlg.about;
+    let text_right_pad = if state.can_show_popup() { 224 } else { 130 };
     draw_text(
         dc,
         "软件更新",
         dlg.font_section,
-        &region(l.update, 16, 13, 130, 22),
+        &region(l.update, 16, 13, text_right_pad, 22),
         primary,
         TextAlign::Left,
         true,
         false,
     );
-    let state = &dlg.about;
     let status = if state.status.is_empty() {
         "检测可用的正式版本"
     } else {
@@ -413,12 +401,25 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
         dc,
         status,
         dlg.font_body,
-        &region(l.update, 16, 36, 130, 22),
+        &region(l.update, 16, 36, text_right_pad, 22),
         status_color,
         TextAlign::Left,
         true,
         false,
     );
+    if state.can_show_popup() {
+        draw_button(
+            sf,
+            dc,
+            &l.details_button,
+            "更新详情",
+            dlg.font_sub,
+            BtnStyle::Secondary,
+            dlg.hover == Hit::About(Action::ShowPopup),
+            dlg.pressed == Hit::About(Action::ShowPopup),
+            s,
+        );
+    }
     match state.action() {
         Some(action) => draw_button(
             sf,
@@ -455,6 +456,31 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
         }
     }
 
+    let auto_lbl = RECT {
+        left: l.auto_row.left + p(16),
+        top: l.auto_row.top,
+        right: l.auto_toggle.left - p(12),
+        bottom: l.auto_row.bottom,
+    };
+    draw_text(
+        dc,
+        "自动检测更新",
+        dlg.font_body,
+        &auto_lbl,
+        primary,
+        TextAlign::Left,
+        true,
+        false,
+    );
+    draw_toggle(
+        sf,
+        &l.auto_toggle,
+        app.settings.auto_check_update,
+        dlg.hover == Hit::About(Action::ToggleAutoUpdate),
+        dlg.pressed == Hit::About(Action::ToggleAutoUpdate),
+        s,
+    );
+
     for (action, rc, text) in &l.links {
         draw_button(
             sf,
@@ -480,136 +506,36 @@ pub(super) fn paint(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
         true,
         false,
     );
-    let (offset, total, visible) = l.scroll_metrics(state);
-    let rc = l.viewport;
-    let save = unsafe { SaveDC(dc) };
-    if save == 0 {
-        return;
-    }
-    unsafe {
-        IntersectClipRect(dc, rc.left, rc.top, rc.right, rc.bottom);
-    }
-    sf.set_clip(Some(rc));
-    let mut top = rc.top - offset;
-    let mut color_items: Vec<(RECT, &str)> = Vec::new();
-    for (index, note) in notes().iter().enumerate() {
-        let row = RECT {
-            top,
-            bottom: top + p(38),
-            right: rc.right - p(8),
-            ..rc
-        };
-        let action = Hit::About(Action::Version(index));
-        let open = state.expanded.contains(&index);
-        if top < rc.bottom && row.bottom > rc.top {
-            let fill = if dlg.pressed == action {
-                0xE3ECFB
-            } else if dlg.hover == action {
-                0xEEF4FF
-            } else {
-                0xF7F9FC
-            };
-            sf.fill_rrect(
-                &RECT {
-                    bottom: row.bottom - p(3),
-                    ..row
-                },
-                7.0 * s,
-                rgb(fill, 1.0),
-            );
-            let (x, y) = ((row.left + p(15)) as f32, (top + p(18)) as f32);
-            let a = 3.2 * s;
-            if open {
-                sf.thick_line(x - a, y - a * 0.5, x, y + a * 0.5, s.max(1.0), muted);
-                sf.thick_line(x, y + a * 0.5, x + a, y - a * 0.5, s.max(1.0), muted);
-            } else {
-                sf.thick_line(x - a * 0.5, y - a, x + a * 0.5, y, s.max(1.0), muted);
-                sf.thick_line(x + a * 0.5, y, x - a * 0.5, y + a, s.max(1.0), muted);
-            }
-            draw_text(
-                dc,
-                &format!("v{}", note.version),
-                dlg.font_section,
-                &region(row, 30, 0, 116, 35),
-                primary,
-                TextAlign::Left,
-                true,
-                false,
-            );
-            draw_text(
-                dc,
-                &note.date,
-                dlg.font_sub,
-                &region(row, 108, 0, 12, 35),
-                muted,
-                TextAlign::Right,
-                true,
-                false,
-            );
-        }
-        top = row.bottom;
-        if open {
-            for section in &note.sections {
-                let section_rc = RECT { top, ..row };
-                draw_text(
-                    dc,
-                    &section.title,
-                    dlg.font_section,
-                    &region(section_rc, 30, 0, 12, 22),
-                    primary,
-                    TextAlign::Left,
-                    true,
-                    false,
-                );
-                top += p(22);
-                for item in &section.items {
-                    let item_rc = RECT { top, ..row };
-                    let text_rc = region(item_rc, 44, 0, 12, 20);
-                    if top < rc.bottom && text_rc.bottom > rc.top {
-                        sf.fill_circle(
-                            (row.left + p(34)) as f32,
-                            (top + p(10)) as f32,
-                            1.7 * s,
-                            muted,
-                        );
-                        color_items.push((text_rc, item.as_str()));
-                    }
-                    top += p(20);
-                }
-            }
-            top += p(8);
-        }
-    }
-    // 批量绘制日志彩色 Emoji 条目，保持滚动区裁剪并保留 GDI 回退路径。
-    if !state.draw_color_items(dc, &rc, p(13), muted, &color_items) {
-        for (text_rc, item) in color_items {
-            draw_text(
-                dc,
-                item,
-                dlg.font_body,
-                &text_rc,
-                muted,
-                TextAlign::Left,
-                true,
-                false,
-            );
-        }
-    }
-    sf.set_clip(None);
-    unsafe {
-        let _ = RestoreDC(dc, save);
-    }
-    let track = RECT {
-        left: rc.right - p(4),
-        ..rc
+    let hover_idx = match dlg.hover {
+        Hit::About(Action::Version(i)) => Some(i),
+        _ => None,
     };
-    draw_scrollbar(
+    let pressed_idx = match dlg.pressed {
+        Hit::About(Action::Version(i)) => Some(i),
+        _ => None,
+    };
+    state.changelog.paint(
         sf,
-        &track,
-        total as usize,
-        visible as usize,
-        offset as usize,
-        false,
+        dc,
+        notes(),
+        &l.viewport,
+        dlg.font_section,
+        dlg.font_body,
+        dlg.font_sub,
+        hover_idx,
+        pressed_idx,
         s,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_release_notes_parse_and_have_current_version_first() {
+        let list = notes();
+        assert!(!list.is_empty());
+        assert_eq!(list[0].version, update::VERSION);
+    }
 }
