@@ -1,6 +1,6 @@
 ﻿[package]
 name = "winlaunchpad"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["CrazyFigure"]
 description = "macOS 风格启动台 for Windows 11"
