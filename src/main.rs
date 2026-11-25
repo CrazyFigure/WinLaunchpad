@@ -29,6 +29,7 @@ mod tray;
 mod ui;
 mod update;
 mod wallpaper;
+mod watcher;
 mod win32;
 
 use std::path::PathBuf;

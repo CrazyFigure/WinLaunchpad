@@ -286,14 +286,47 @@ impl IconCache {
             self.order.push_back(key.clone());
         }
         self.bytes += cost;
-        // 源图标更新时失效对应预烘焙精灵
-        self.sprites.retain(|(k, _, _), _| k != &key);
+        // 源图标更新时失效对应预烘焙精灵并同步扣减精灵缓存字节计数
+        self.sprites.retain(|(k, _, _), sp| {
+            if k == &key {
+                self.sprite_bytes = self.sprite_bytes.saturating_sub((sp.w * sp.h * 4) as usize);
+                false
+            } else {
+                true
+            }
+        });
+        self.sprite_order.retain(|(k, _, _)| k != &key);
         while self.bytes > ICON_BUDGET {
             let Some(old) = self.order.pop_front() else { break };
             if let Some(b) = self.map.remove(&old) {
                 self.bytes -= (b.w * b.h * 4) as usize;
             }
         }
+    }
+
+    /// 移除单个图标及其关联精灵缓存（用于应用卸载或图标源文件更新后失效缓存）。
+    pub fn remove(&mut self, key: &str) {
+        if let Some(old) = self.map.remove(key) {
+            self.bytes = self.bytes.saturating_sub((old.w * old.h * 4) as usize);
+            self.order.retain(|k| k != key);
+        }
+        self.sprites.retain(|(k, _, _), sp| {
+            if k == key {
+                self.sprite_bytes = self.sprite_bytes.saturating_sub((sp.w * sp.h * 4) as usize);
+                false
+            } else {
+                true
+            }
+        });
+        self.sprite_order.retain(|(k, _, _)| k != key);
+    }
+
+    /// 清空全部内存图标与预烘焙精灵缓存。
+    pub fn clear_all(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+        self.clear_sprites();
     }
 
     /// 获取或一次性烘焙指定尺寸及圆角弧度的含阴影 1:1 图标精灵，保障滑动翻页高帧率。
@@ -1014,5 +1047,24 @@ mod tests {
 
         let l_custom = compute_layout(3072, 1920, 2.0, 56, 9, 6);
         assert_eq!((l_custom.cols, l_custom.rows), (9, 6));
+    }
+
+    #[test]
+    fn icon_cache_remove_and_clear_update_bytes() {
+        let mut cache = super::IconCache::new();
+        let px = crate::ui::IconPixels {
+            w: 8,
+            h: 8,
+            px: std::sync::Arc::new(vec![255u8; 8 * 8 * 4]),
+        };
+        cache.insert("k1".into(), px.clone());
+        cache.insert("k2".into(), px);
+        let _ = cache.get_or_bake_sprite("k1", 16, 2, 0.225);
+        assert!(cache.contains("k1"));
+        cache.remove("k1");
+        assert!(!cache.contains("k1"));
+        assert!(cache.contains("k2"));
+        cache.clear_all();
+        assert!(!cache.contains("k2"));
     }
 }

@@ -110,6 +110,37 @@ impl IconWorker {
         }
     }
 
+    /// 返回指定 `icon_key` 当前最早的磁盘缓存修改时间（用于对比程序源文件是否已更新）。
+    pub fn disk_cache_mtime(cache_dir: &Path, key: &str) -> Option<std::time::SystemTime> {
+        if key.is_empty() {
+            return None;
+        }
+        let mut oldest: Option<std::time::SystemTime> = None;
+        for bucket in [64u32, 96, 128, 160] {
+            let p = Self::cache_path(cache_dir, key, bucket);
+            if let Ok(meta) = std::fs::metadata(&p) {
+                if let Ok(mtime) = meta.modified() {
+                    oldest = Some(match oldest {
+                        Some(prev) => prev.min(mtime),
+                        None => mtime,
+                    });
+                }
+            }
+        }
+        oldest
+    }
+
+    /// 清空磁盘图标缓存目录下的全部 `.icache` 文件。
+    pub fn clear_disk_cache(cache_dir: &Path) {
+        let Ok(rd) = std::fs::read_dir(cache_dir) else { return };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().map(|e| e.eq_ignore_ascii_case("icache")).unwrap_or(false) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     /// 同步尝试从磁盘缓存读取已提取图标（主线程快捷读取，无 Shell 调用）。
     pub fn read_disk_cache(&self, key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
         read_cache_file(&Self::cache_path(&self.cache_dir, key, size))
@@ -736,5 +767,17 @@ mod tests {
         // 卡片本体应该被放大填充至接近目标边长 85%（中心 10..89 内应全为绿色实体）
         let edge_pt = ((50 * 100 + 12) * 4) as usize;
         assert!(out[edge_pt + 3] > 230 && out[edge_pt + 1] > 180);
+    }
+
+    #[test]
+    fn disk_cache_mtime_and_clear_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = r"C:\Demo\app.exe";
+        assert!(super::IconWorker::disk_cache_mtime(dir.path(), key).is_none());
+        let cache_p = super::IconWorker::cache_path(dir.path(), key, 64);
+        super::write_cache_file(&cache_p, &[1u8; 16], 2, 2);
+        assert!(super::IconWorker::disk_cache_mtime(dir.path(), key).is_some());
+        super::IconWorker::clear_disk_cache(dir.path());
+        assert!(super::IconWorker::disk_cache_mtime(dir.path(), key).is_none());
     }
 }

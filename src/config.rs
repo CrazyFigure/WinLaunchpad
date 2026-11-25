@@ -40,6 +40,33 @@ fn default_roundness() -> u8 {
     1
 }
 
+fn default_scan_interval_secs() -> u32 {
+    30
+}
+
+/// 后台定时自动扫描间隔预设档位（0 表示关闭定时扫描，默认 30 秒）。
+pub const SCAN_INTERVAL_PRESETS: &[(u32, &str)] = &[
+    (10, "10 秒"),
+    (20, "20 秒"),
+    (30, "30 秒"),
+    (60, "1 分钟"),
+    (300, "5 分钟"),
+    (0, "关闭"),
+];
+
+/// 将任意秒数吸附到最接近的定时扫描间隔预设档位（0 保留为关闭）。
+pub fn snap_scan_interval_secs(secs: u32) -> u32 {
+    if secs == 0 {
+        return 0;
+    }
+    SCAN_INTERVAL_PRESETS
+        .iter()
+        .filter(|&&(v, _)| v > 0)
+        .min_by_key(|&&(v, _)| (v as i64 - secs as i64).abs())
+        .map(|&(v, _)| v)
+        .unwrap_or(30)
+}
+
 /// 图标圆角圆润度 3 档设置（0=微圆角, 1=标准, 2=圆润）。
 pub const ICON_ROUNDNESS_PRESETS: &[(u8, &str, f32)] = &[
     (0, "微圆角", 0.12),
@@ -95,6 +122,18 @@ pub struct Settings {
     /// 用户手动添加的条目
     #[serde(default)]
     pub manual: Vec<AppEntry>,
+    /// 后台定时扫描刷新间隔（秒，0 表示关闭定时扫描，默认 30）
+    #[serde(default = "default_scan_interval_secs")]
+    pub scan_interval_secs: u32,
+    /// 是否启用安装/卸载事件驱动监听（默认开启）
+    #[serde(default = "default_true")]
+    pub event_watch_enabled: bool,
+    /// 展开启动台面板时是否在后台静默刷新一次（默认关闭）
+    #[serde(default)]
+    pub scan_on_show: bool,
+    /// 检测到快捷方式或程序变更时自动更新图标缓存（默认开启）
+    #[serde(default = "default_true")]
+    pub refresh_changed_icons: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +153,10 @@ impl Default for Settings {
             app_overrides: HashMap::new(),
             hidden: Vec::new(),
             manual: Vec::new(),
+            scan_interval_secs: default_scan_interval_secs(),
+            event_watch_enabled: true,
+            scan_on_show: false,
+            refresh_changed_icons: true,
         }
     }
 }
@@ -187,6 +230,7 @@ impl Store {
         s.icon_roundness = s.icon_roundness.min(2);
         s.grid_cols = if s.grid_cols <= 0 { 0 } else { s.grid_cols.clamp(4, 10) };
         s.grid_rows = if s.grid_rows <= 0 { 0 } else { s.grid_rows.clamp(3, 8) };
+        s.scan_interval_secs = snap_scan_interval_secs(s.scan_interval_secs);
         s
     }
 
@@ -233,5 +277,29 @@ impl Store {
 
     pub fn save_catalog(&self, c: &CatalogCache) -> bool {
         self.write_json(&self.catalog_path(), c, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_interval_snaps_to_presets() {
+        assert_eq!(snap_scan_interval_secs(0), 0);
+        assert_eq!(snap_scan_interval_secs(10), 10);
+        assert_eq!(snap_scan_interval_secs(20), 20);
+        assert_eq!(snap_scan_interval_secs(27), 30);
+        assert_eq!(snap_scan_interval_secs(60), 60);
+        assert_eq!(snap_scan_interval_secs(290), 300);
+    }
+
+    #[test]
+    fn legacy_settings_json_gets_refresh_defaults() {
+        let s: Settings = serde_json::from_str(r#"{"version":2}"#).unwrap();
+        assert_eq!(s.scan_interval_secs, 30);
+        assert!(s.event_watch_enabled);
+        assert!(!s.scan_on_show);
+        assert!(s.refresh_changed_icons);
     }
 }

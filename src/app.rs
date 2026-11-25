@@ -1,7 +1,8 @@
 ﻿//! 主窗口与应用状态：全屏覆盖（含任务栏）、搜索框、丝滑滑动翻页、空白退出、右键菜单、实时轨迹浮窗与子进程调度。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
@@ -12,6 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     BLENDFUNCTION, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     PAINTSTRUCT, SRCCOPY,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::Ime::{
@@ -39,6 +41,7 @@ use crate::ui::{
     IconPixels, TextAlign,
 };
 use crate::wallpaper;
+use crate::watcher::{AppWatcher, WATCH_FLAG_UWP, WM_APP_WATCH_EVENT};
 use crate::win32::*;
 
 #[link(name = "winmm")]
@@ -58,11 +61,104 @@ pub const WM_APP_UPDATE_EXIT: u32 = WM_APP + 10;
 const TIMER_FADE: usize = 1;
 const TIMER_SLIDE: usize = 2;
 const TIMER_TOOLTIP: usize = 3;
+const TIMER_AUTO_SCAN: usize = 4;
+const SHOW_SCAN_THROTTLE_SECS: u64 = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FADE_DURATION_MS: f32 = 135.0;
 const WM_POWERBROADCAST_MSG: u32 = 0x0218;
 const PBT_APMRESUMESUSPEND_WPARAM: usize = 0x0007;
 const PBT_APMRESUMEAUTOMATIC_WPARAM: usize = 0x0012;
+
+/// 触发目录扫描的来源类型，用于控制状态提示可见性与图标失效策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanKind {
+    Startup,
+    Periodic,
+    Show,
+    Event { uwp_changed: bool },
+    Manual,
+}
+
+impl ScanKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanKind::Startup => "启动扫描",
+            ScanKind::Periodic => "定时刷新",
+            ScanKind::Show => "呼出刷新",
+            ScanKind::Event { .. } => "事件驱动",
+            ScanKind::Manual => "手动扫描",
+        }
+    }
+}
+
+/// 合并扫描进行期间新到达的挂起扫描请求，确保事件驱动与手动扫描不被降级。
+fn merge_scan_kind(prev: Option<ScanKind>, next: ScanKind) -> ScanKind {
+    match (prev, next) {
+        (Some(ScanKind::Manual), _) | (_, ScanKind::Manual) => ScanKind::Manual,
+        (Some(ScanKind::Event { uwp_changed: a }), ScanKind::Event { uwp_changed: b }) => {
+            ScanKind::Event { uwp_changed: a || b }
+        }
+        (Some(ScanKind::Event { uwp_changed }), _) | (_, ScanKind::Event { uwp_changed }) => {
+            ScanKind::Event { uwp_changed }
+        }
+        _ => next,
+    }
+}
+
+fn local_hms() -> String {
+    unsafe {
+        let st = GetLocalTime();
+        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
+    }
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    if path.is_empty() || path.starts_with("shell:") {
+        return None;
+    }
+    let exp = if path.contains('%') {
+        catalog::expand_env(path)
+    } else {
+        path.to_string()
+    };
+    std::fs::metadata(Path::new(&exp)).and_then(|m| m.modified()).ok()
+}
+
+/// 检查桌面快捷方式或关联程序文件是否比本地图标磁盘缓存更新。
+fn source_newer_than_cache(entry: &AppEntry, icons_dir: &Path) -> bool {
+    if entry.icon_key.is_empty() || entry.icon_key.starts_with("shell:") {
+        return false;
+    }
+    let Some(cache_mt) = IconWorker::disk_cache_mtime(icons_dir, &entry.icon_key) else {
+        return false;
+    };
+    if let Some(key_mt) = file_mtime(&entry.icon_key) {
+        if key_mt > cache_mt {
+            return true;
+        }
+    }
+    if entry.icon_key.to_lowercase().ends_with(".lnk") {
+        if let Some(target_path) = entry.aliases.first() {
+            if let Some(target_mt) = file_mtime(target_path) {
+                if target_mt > cache_mt {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn entry_meta_eq(a: &AppEntry, b: &AppEntry) -> bool {
+    a.id == b.id
+        && a.name == b.name
+        && a.source == b.source
+        && a.target == b.target
+        && a.args == b.args
+        && a.icon_key == b.icon_key
+        && a.folder_id == b.folder_id
+        && a.folder_name == b.folder_name
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum TipTarget {
@@ -404,6 +500,12 @@ pub struct App {
     pub taskbar_created_msg: u32,
     pub gesture: Option<gesture::GestureHandle>,
     gesture_overlay: GestureOverlay,
+    pub watcher: Option<AppWatcher>,
+    active_scan_kind: ScanKind,
+    pending_scan_kind: Option<ScanKind>,
+    pub last_scan_time_text: String,
+    pub last_scan_kind: Option<ScanKind>,
+    last_show_scan_at: Option<Instant>,
     pub settings_hwnd: HWND,
     pub add_hwnd: HWND,
     pub exiting: bool,
@@ -491,6 +593,12 @@ impl App {
             taskbar_created_msg,
             gesture: None,
             gesture_overlay: GestureOverlay::new(),
+            watcher: None,
+            active_scan_kind: ScanKind::Startup,
+            pending_scan_kind: None,
+            last_scan_time_text: String::new(),
+            last_scan_kind: None,
+            last_show_scan_at: None,
             settings_hwnd: HWND::default(),
             add_hwnd: HWND::default(),
             exiting: false,
@@ -519,7 +627,7 @@ impl App {
         Ok(app)
     }
 
-    /// 窗口创建完成后调用：托盘、热键、图标与扫描调度、手势线程。
+    /// 窗口创建完成后调用：托盘、热键、图标与扫描调度、手势线程、事件监听线程。
     pub fn post_init(&mut self) {
         self.hotkey = self.settings.hotkey;
         self.hotkey_active = hotkey::register(self.hwnd, self.hotkey);
@@ -537,7 +645,9 @@ impl App {
             }
         }
         self.rebuild_view();
-        self.start_scan();
+        self.sync_scan_timer();
+        self.sync_watcher();
+        self.start_scan_with(ScanKind::Startup);
         self.ensure_wallpaper_async();
     }
 
@@ -708,11 +818,67 @@ impl App {
         (self.layout.cols.max(3), self.layout.rows.max(2))
     }
 
+    /// 同步后台定时自动扫描计时器（0 秒表示关闭定时轮询）。
+    pub fn sync_scan_timer(&mut self) {
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
+            if !self.exiting && self.settings.scan_interval_secs > 0 {
+                let ms = self.settings.scan_interval_secs.saturating_mul(1000).max(1000);
+                let _ = SetTimer(self.hwnd, TIMER_AUTO_SCAN, ms, None);
+            }
+        }
+    }
+
+    /// 同步安装/卸载事件驱动监听线程启停状态。
+    pub fn sync_watcher(&mut self) {
+        if !self.exiting && self.settings.event_watch_enabled {
+            if self.watcher.is_none() && !self.hwnd.is_invalid() {
+                self.watcher = AppWatcher::start(self.hwnd);
+            }
+        } else if let Some(mut w) = self.watcher.take() {
+            w.stop();
+        }
+    }
+
+    /// 清空内存与磁盘图标缓存并立即重新提取当前页图标。
+    pub fn rebuild_all_icons(&mut self) {
+        self.renderer.icons.clear_all();
+        if let Some(icons) = &self.icons {
+            icons.clear();
+        }
+        IconWorker::clear_disk_cache(&self.store.icons_dir());
+        self.request_page_icons();
+        if self.visible {
+            self.invalidate();
+        }
+        unsafe {
+            if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
+                let _ = InvalidateRect(self.settings_hwnd, None, false);
+            }
+        }
+    }
+
     pub fn start_scan(&mut self) {
+        self.start_scan_with(ScanKind::Manual);
+    }
+
+    pub fn start_scan_with(&mut self, kind: ScanKind) {
+        if self.exiting {
+            return;
+        }
         if self.scanning {
+            // 扫描进行中时合并挂起请求（定时轮询不额外排队，事件/手动优先保留）
+            if !matches!(kind, ScanKind::Periodic) {
+                self.pending_scan_kind = Some(merge_scan_kind(self.pending_scan_kind, kind));
+            }
             return;
         }
         self.scanning = true;
+        self.active_scan_kind = kind;
+        let show_status = matches!(kind, ScanKind::Manual | ScanKind::Startup) || self.view.is_empty();
         let hwnd = self.hwnd.0 as isize;
         let out_file = self.store.dir.join(format!("scan_{}.tmp.json", std::process::id()));
         std::thread::Builder::new()
@@ -763,8 +929,13 @@ impl App {
                 }
             })
             .ok();
-        if self.visible {
+        if show_status && self.visible {
             self.invalidate();
+        }
+        unsafe {
+            if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
+                let _ = InvalidateRect(self.settings_hwnd, None, false);
+            }
         }
     }
 
@@ -851,12 +1022,102 @@ impl App {
     }
 
     fn on_scan_done(&mut self, r: ScanResult) {
+        let kind = self.active_scan_kind;
         let prev_sel = self
             .selected
             .and_then(|i| self.filtered.get(i))
             .map(|&vi| self.view[vi].entry.id.clone());
         self.scanning = false;
-        if !r.entries.is_empty() || self.scan.entries.is_empty() {
+        let usable = !r.entries.is_empty() || self.scan.entries.is_empty();
+        if usable {
+            self.last_scan_time_text = local_hms();
+            self.last_scan_kind = Some(kind);
+        }
+
+        let icons_dir = self.store.icons_dir();
+        let mut entries_changed = false;
+        let mut changed_keys: Vec<String> = Vec::new();
+        let mut removed_keys: Vec<String> = Vec::new();
+
+        if usable {
+            let old_map: HashMap<&str, &AppEntry> =
+                self.scan.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+            let new_map: HashMap<&str, &AppEntry> =
+                r.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+
+            if old_map.len() != new_map.len() {
+                entries_changed = true;
+            }
+            for e in &r.entries {
+                match old_map.get(e.id.as_str()) {
+                    None => {
+                        entries_changed = true;
+                        if !e.icon_key.is_empty() {
+                            changed_keys.push(e.icon_key.clone());
+                        }
+                    }
+                    Some(prev) => {
+                        if !entry_meta_eq(prev, e) {
+                            entries_changed = true;
+                            if !e.icon_key.is_empty() {
+                                changed_keys.push(e.icon_key.clone());
+                            }
+                            if !prev.icon_key.is_empty() && prev.icon_key != e.icon_key {
+                                removed_keys.push(prev.icon_key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for old in &self.scan.entries {
+                if !new_map.contains_key(old.id.as_str()) {
+                    entries_changed = true;
+                    if !old.icon_key.is_empty() {
+                        removed_keys.push(old.icon_key.clone());
+                    }
+                }
+            }
+
+            let active_keys: HashSet<&str> = r
+                .entries
+                .iter()
+                .chain(self.settings.manual.iter())
+                .map(|e| e.icon_key.as_str())
+                .filter(|k| !k.is_empty())
+                .collect();
+            removed_keys.retain(|k| !active_keys.contains(k.as_str()));
+
+            // 在事件驱动/手动/启动扫描或目录变化时，校验源文件修改时间并失效旧图标缓存
+            let check_mtime = self.settings.refresh_changed_icons
+                && (entries_changed
+                    || matches!(kind, ScanKind::Event { .. } | ScanKind::Manual | ScanKind::Startup));
+            if check_mtime {
+                for e in r.entries.iter().chain(self.settings.manual.iter()) {
+                    if source_newer_than_cache(e, &icons_dir) && !e.icon_key.is_empty() {
+                        changed_keys.push(e.icon_key.clone());
+                    }
+                }
+            }
+        }
+
+        let mut invalidated_set: HashSet<String> = HashSet::new();
+        for k in removed_keys {
+            if invalidated_set.insert(k.clone()) {
+                self.renderer.icons.remove(&k);
+                IconWorker::remove_disk_cache_for_key(&icons_dir, &k);
+            }
+        }
+        let mut refresh_targets: Vec<String> = Vec::new();
+        for k in changed_keys {
+            if invalidated_set.insert(k.clone()) {
+                self.renderer.icons.remove(&k);
+                IconWorker::remove_disk_cache_for_key(&icons_dir, &k);
+                refresh_targets.push(k);
+            }
+        }
+        let icons_invalidated = !invalidated_set.is_empty();
+
+        if usable && entries_changed {
             self.scan = r;
             let cache = CatalogCache {
                 version: 1,
@@ -864,6 +1125,17 @@ impl App {
                 entries: self.scan.entries.clone(),
             };
             self.store.save_catalog(&cache);
+        } else if usable {
+            self.scan.scanned_at = r.scanned_at;
+            self.scan.errors = r.errors;
+        }
+
+        let validity_changed = self
+            .view
+            .iter()
+            .any(|v| catalog::is_entry_target_valid(&v.entry) != v.valid);
+
+        if entries_changed || validity_changed || icons_invalidated {
             self.rebuild_view();
             if let Some(id) = prev_sel {
                 if let Some(pos) = self.filtered.iter().position(|&vi| self.view[vi].entry.id == id) {
@@ -871,22 +1143,35 @@ impl App {
                     self.page = pos / self.per_page();
                 }
             }
+            self.request_page_icons();
+            // 预先提取新增或更新条目的图标，确保翻页立即可见
+            for k in refresh_targets.iter().take(24) {
+                self.request_icon_async(k);
+            }
+            if self.visible {
+                self.invalidate();
+            }
+        } else if matches!(kind, ScanKind::Startup | ScanKind::Manual) {
+            self.request_page_icons();
+            if self.visible {
+                self.invalidate();
+            }
         }
-        if !self.scan.errors.is_empty() {
+
+        if !self.scan.errors.is_empty() && matches!(kind, ScanKind::Startup | ScanKind::Manual) {
             log::log(&format!(
                 "扫描完成，{} 个条目，{} 个来源问题",
                 self.scan.entries.len(),
                 self.scan.errors.len()
             ));
         }
-        self.request_page_icons();
-        if self.visible {
-            self.invalidate();
-        }
         unsafe {
             if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
                 let _ = PostMessageW(self.settings_hwnd, WM_APP_SCAN, WPARAM(0), LPARAM(0));
             }
+        }
+        if let Some(next_kind) = self.pending_scan_kind.take() {
+            self.start_scan_with(next_kind);
         }
     }
 
@@ -1036,6 +1321,16 @@ impl App {
         }
         self.ensure_wallpaper_async();
         self.prefetch_neighbor_icons();
+        if self.settings.scan_on_show {
+            let allow = self
+                .last_show_scan_at
+                .map(|t| t.elapsed() >= Duration::from_secs(SHOW_SCAN_THROTTLE_SECS))
+                .unwrap_or(true);
+            if allow {
+                self.last_show_scan_at = Some(Instant::now());
+                self.start_scan_with(ScanKind::Show);
+            }
+        }
     }
 
     fn sync_edit_font(&mut self) {
@@ -1574,6 +1869,12 @@ impl App {
         self.fading = false;
         self.slide_anim = false;
         self.sync_hi_res_timer();
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
+        }
+        if let Some(mut w) = self.watcher.take() {
+            w.stop();
+        }
         self.gesture_overlay.destroy();
         self.store.save_settings(&self.settings);
         hotkey::unregister(self.hwnd);
@@ -1606,7 +1907,10 @@ impl App {
             Some((np, off)) if np != self.page => (self.items_for_page(np), off),
             _ => (Vec::new(), 0),
         };
-        let status = if self.scanning {
+        let show_scanning = self.scanning
+            && (matches!(self.active_scan_kind, ScanKind::Manual | ScanKind::Startup)
+                || self.view.is_empty());
+        let status = if show_scanning {
             "正在扫描已安装的应用…".to_string()
         } else if !self.scan.errors.is_empty() {
             format!("{} 个来源读取失败（详见日志）", self.scan.errors.len())
@@ -1695,6 +1999,12 @@ impl App {
                 self.fading = false;
                 self.slide_anim = false;
                 self.sync_hi_res_timer();
+                unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
+                }
+                if let Some(mut w) = self.watcher.take() {
+                    w.stop();
+                }
                 self.gesture_overlay.destroy();
                 self.edit_target.release();
                 unsafe {
@@ -1709,11 +2019,14 @@ impl App {
                 LRESULT(0)
             }
             WM_POWERBROADCAST_MSG => {
-                if self.settings.gestures_enabled
-                    && matches!(wparam.0, PBT_APMRESUMESUSPEND_WPARAM | PBT_APMRESUMEAUTOMATIC_WPARAM)
-                {
-                    if let Some(g) = &self.gesture {
-                        g.force_reinstall();
+                if matches!(wparam.0, PBT_APMRESUMESUSPEND_WPARAM | PBT_APMRESUMEAUTOMATIC_WPARAM) {
+                    if self.settings.gestures_enabled {
+                        if let Some(g) = &self.gesture {
+                            g.force_reinstall();
+                        }
+                    }
+                    if self.settings.event_watch_enabled {
+                        self.start_scan_with(ScanKind::Event { uwp_changed: false });
                     }
                 }
                 LRESULT(1)
@@ -1850,6 +2163,9 @@ impl App {
                             self.invalidate();
                         }
                     }
+                    TIMER_AUTO_SCAN => {
+                        self.start_scan_with(ScanKind::Periodic);
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -1862,6 +2178,13 @@ impl App {
             WM_APP_SCAN => {
                 let r = unsafe { *Box::from_raw(lparam.0 as *mut ScanResult) };
                 self.on_scan_done(r);
+                LRESULT(0)
+            }
+            WM_APP_WATCH_EVENT => {
+                if self.settings.event_watch_enabled {
+                    let uwp_changed = (wparam.0 & WATCH_FLAG_UWP) != 0;
+                    self.start_scan_with(ScanKind::Event { uwp_changed });
+                }
                 LRESULT(0)
             }
             WM_APP_ICON => {

@@ -21,7 +21,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::{App, WM_APP_SCAN, WM_APP_UPDATE_EXIT};
 use crate::catalog::{self, AppEntry, ExpiredItem};
-use crate::config::{snap_icon_size_dp, ICON_ROUNDNESS_PRESETS, ICON_SIZE_PRESETS};
+use crate::config::{
+    snap_icon_size_dp, snap_scan_interval_secs, ICON_ROUNDNESS_PRESETS, ICON_SIZE_PRESETS,
+    SCAN_INTERVAL_PRESETS,
+};
 use crate::hotkey::{self, HotkeySpec};
 use crate::icons::IconWorker;
 use crate::startup;
@@ -40,6 +43,7 @@ const ID_FOLDER_SEARCH: i32 = 3001;
 enum Tab {
     General,
     Folders,
+    Refresh,
     Gestures,
     About,
 }
@@ -109,6 +113,13 @@ enum Hit {
     ExpiredDeleteAll,
     ExpiredDeleteOne(usize),
     ExpiredRow(usize),
+    // 扫描刷新
+    RefreshIntervalPreset(usize),
+    ToggleScanOnShow,
+    ToggleEventWatch,
+    ToggleRefreshChangedIcons,
+    RebuildIconsCache,
+    RefreshReset,
     // 鼠标手势
     ToggleGesture,
     ToggleGestureSwap,
@@ -161,7 +172,7 @@ struct Layout {
     header_h: i32,
     footer_h: i32,
     close_btn: RECT,
-    tabs: [(Tab, RECT, &'static str); 4],
+    tabs: [(Tab, RECT, &'static str); 5],
     rescan_btn: RECT,
     expired_btn: RECT,
     // Tab General
@@ -220,6 +231,20 @@ struct Layout {
     gesture_row2: RECT,
     gesture_swap_toggle: RECT,
     gesture_cards: [RECT; 5],
+    // Tab Refresh
+    refresh_timer_card: RECT,
+    refresh_interval_row: RECT,
+    refresh_interval_presets: [RECT; 6],
+    refresh_on_show_row: RECT,
+    refresh_on_show_toggle: RECT,
+    refresh_event_card: RECT,
+    refresh_event_row: RECT,
+    refresh_event_toggle: RECT,
+    refresh_icons_row: RECT,
+    refresh_icons_toggle: RECT,
+    refresh_status_card: RECT,
+    refresh_rebuild_btn: RECT,
+    refresh_reset_btn: RECT,
     // Tab About
     about: about::Layout,
 }
@@ -295,8 +320,9 @@ impl Dlg {
         let tabs = [
             (Tab::General, RECT { left: s(12.0), top: tab_top0, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h }, "常规设置"),
             (Tab::Folders, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap), right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 2 + tab_gap }, "自动发现文件夹"),
-            (Tab::Gestures, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 2, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 3 + tab_gap * 2 }, "鼠标手势"),
-            (Tab::About, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 3, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 4 + tab_gap * 3 }, "关于"),
+            (Tab::Refresh, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 2, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 3 + tab_gap * 2 }, "扫描刷新"),
+            (Tab::Gestures, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 3, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 4 + tab_gap * 3 }, "鼠标手势"),
+            (Tab::About, RECT { left: s(12.0), top: tab_top0 + (tab_h + tab_gap) * 4, right: sidebar_w - s(12.0), bottom: tab_top0 + tab_h * 5 + tab_gap * 4 }, "关于"),
         ];
 
         let fy = h - footer_h + (footer_h - s(32.0)) / 2;
@@ -431,6 +457,36 @@ impl Dlg {
         let g4 = RECT { left: g3.right + g_gap, top: g_top2, right: g3.right + g_gap + card_w3, bottom: g_top2 + card_h };
         let gesture_cards = [g0, g1, g2, g3, g4];
 
+        // Tab Refresh（定时扫描间隔 6 档 + 呼出刷新 + 事件驱动监听 + 图标缓存同步 + 运行状态）
+        let r_rh = s(48.0);
+        let refresh_timer_card = RECT { left: content.left, top: content.top, right: content.right, bottom: content.top + r_rh * 2 };
+        let refresh_interval_row = RECT { left: refresh_timer_card.left, top: refresh_timer_card.top, right: refresh_timer_card.right, bottom: refresh_timer_card.top + r_rh };
+        let refresh_on_show_row = RECT { left: refresh_timer_card.left, top: refresh_timer_card.top + r_rh, right: refresh_timer_card.right, bottom: refresh_timer_card.bottom };
+        let refresh_on_show_toggle = RECT { left: refresh_timer_card.right - s(16.0) - tw, top: refresh_on_show_row.top + (r_rh - th) / 2, right: refresh_timer_card.right - s(16.0), bottom: refresh_on_show_row.top + (r_rh + th) / 2 };
+
+        let spw = s(56.0);
+        let sp_start = refresh_timer_card.right - s(16.0) - (spw * 6 + pgap * 5);
+        let mut refresh_interval_presets = [RECT::default(); 6];
+        for (i, slot) in refresh_interval_presets.iter_mut().enumerate() {
+            let x = sp_start + i as i32 * (spw + pgap);
+            *slot = RECT {
+                left: x,
+                top: refresh_interval_row.top + s(9.0),
+                right: x + spw,
+                bottom: refresh_interval_row.bottom - s(9.0),
+            };
+        }
+
+        let refresh_event_card = RECT { left: content.left, top: refresh_timer_card.bottom + s(10.0), right: content.right, bottom: refresh_timer_card.bottom + s(10.0) + r_rh * 2 };
+        let refresh_event_row = RECT { left: refresh_event_card.left, top: refresh_event_card.top, right: refresh_event_card.right, bottom: refresh_event_card.top + r_rh };
+        let refresh_icons_row = RECT { left: refresh_event_card.left, top: refresh_event_card.top + r_rh, right: refresh_event_card.right, bottom: refresh_event_card.bottom };
+        let refresh_event_toggle = RECT { left: refresh_event_card.right - s(16.0) - tw, top: refresh_event_row.top + (r_rh - th) / 2, right: refresh_event_card.right - s(16.0), bottom: refresh_event_row.top + (r_rh + th) / 2 };
+        let refresh_icons_toggle = RECT { left: refresh_event_card.right - s(16.0) - tw, top: refresh_icons_row.top + (r_rh - th) / 2, right: refresh_event_card.right - s(16.0), bottom: refresh_icons_row.top + (r_rh + th) / 2 };
+
+        let refresh_status_card = RECT { left: content.left, top: refresh_event_card.bottom + s(10.0), right: content.right, bottom: refresh_event_card.bottom + s(10.0) + s(56.0) };
+        let refresh_reset_btn = RECT { left: refresh_status_card.right - s(16.0) - s(76.0), top: refresh_status_card.top + s(13.0), right: refresh_status_card.right - s(16.0), bottom: refresh_status_card.bottom - s(13.0) };
+        let refresh_rebuild_btn = RECT { left: refresh_reset_btn.left - s(8.0) - s(104.0), top: refresh_status_card.top + s(13.0), right: refresh_reset_btn.left - s(8.0), bottom: refresh_status_card.bottom - s(13.0) };
+
         let about = about::Layout::new(content, rescan_btn, self.scale);
 
         Layout {
@@ -444,6 +500,9 @@ impl Dlg {
             btn_folder_all, btn_tree_expand, btn_add_manual, btn_exp_back, btn_exp_del_all,
             app_list_rc, app_scroll_rc, app_row_h, app_vis, exp_row_h, exp_vis,
             gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle, gesture_cards,
+            refresh_timer_card, refresh_interval_row, refresh_interval_presets, refresh_on_show_row, refresh_on_show_toggle,
+            refresh_event_card, refresh_event_row, refresh_event_toggle, refresh_icons_row, refresh_icons_toggle,
+            refresh_status_card, refresh_rebuild_btn, refresh_reset_btn,
             about,
         }
     }
@@ -1014,6 +1073,28 @@ impl Dlg {
                     }
                 }
             }
+            Tab::Refresh => {
+                for (i, r) in l.refresh_interval_presets.iter().enumerate() {
+                    if inside(r, x, y) {
+                        return Hit::RefreshIntervalPreset(i);
+                    }
+                }
+                if inside(&l.refresh_on_show_toggle, x, y) || inside(&l.refresh_on_show_row, x, y) {
+                    return Hit::ToggleScanOnShow;
+                }
+                if inside(&l.refresh_event_toggle, x, y) || inside(&l.refresh_event_row, x, y) {
+                    return Hit::ToggleEventWatch;
+                }
+                if inside(&l.refresh_icons_toggle, x, y) || inside(&l.refresh_icons_row, x, y) {
+                    return Hit::ToggleRefreshChangedIcons;
+                }
+                if inside(&l.refresh_rebuild_btn, x, y) {
+                    return Hit::RebuildIconsCache;
+                }
+                if inside(&l.refresh_reset_btn, x, y) {
+                    return Hit::RefreshReset;
+                }
+            }
             Tab::Gestures => {
                 if inside(&l.gesture_toggle, x, y) || inside(&l.gesture_row1, x, y) {
                     return Hit::ToggleGesture;
@@ -1260,6 +1341,39 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
             let specs = gesture_card_specs(app.settings.gesture_swap_lr, &app.hotkey.display());
             specs.get(idx).map(|spec| (Hit::GestureCard(idx), l.gesture_cards[idx], spec.tip.clone()))
         }
+        Hit::RefreshIntervalPreset(i) => SCAN_INTERVAL_PRESETS.get(i).map(|&(secs, name)| {
+            let tip = match secs {
+                0 => "关闭定时自动扫描，仅通过事件驱动、呼出或手动触发".to_string(),
+                30 => format!("每 {name} 自动扫描一次（默认 · 兼顾实时性与资源占用）"),
+                _ => format!("每 {name} 自动扫描一次"),
+            };
+            (Hit::RefreshIntervalPreset(i), l.refresh_interval_presets[i], tip)
+        }),
+        Hit::ToggleScanOnShow => Some((
+            Hit::ToggleScanOnShow,
+            l.refresh_on_show_toggle,
+            "每次呼出启动台后在后台静默检查一次应用变化（5 秒节流）".into(),
+        )),
+        Hit::ToggleEventWatch => Some((
+            Hit::ToggleEventWatch,
+            l.refresh_event_toggle,
+            "监听开始菜单、App Paths、卸载列表与商店应用包变更，安装或卸载后自动扫描并更新图标".into(),
+        )),
+        Hit::ToggleRefreshChangedIcons => Some((
+            Hit::ToggleRefreshChangedIcons,
+            l.refresh_icons_toggle,
+            "检测到快捷方式或程序文件更新时，自动失效旧缓存并重新提取图标".into(),
+        )),
+        Hit::RebuildIconsCache => Some((
+            Hit::RebuildIconsCache,
+            l.refresh_rebuild_btn,
+            "清空内存与磁盘中的全部图标缓存并立即重新提取".into(),
+        )),
+        Hit::RefreshReset => Some((
+            Hit::RefreshReset,
+            l.refresh_reset_btn,
+            "将定时扫描间隔、事件驱动与图标更新选项恢复为默认值".into(),
+        )),
         _ => None,
     };
 
@@ -1303,6 +1417,27 @@ fn draw_sidebar_icon(sf: &mut Surface, tab: Tab, cx: f32, cy: f32, active: bool,
             sf.stroke_rrect(&r, 2.5 * s, sw, c);
             sf.thick_line(cx - 5.5 * s, cy - 6.5 * s, cx - 0.5 * s, cy - 6.5 * s, sw, c);
         }
+        Tab::Refresh => {
+            let r = 5.6 * s;
+            let steps = 20usize;
+            let a_start = 0.45f32;
+            let a_end = 5.42f32;
+            let mut prev = (cx + a_start.cos() * r, cy + a_start.sin() * r);
+            for k in 1..=steps {
+                let t = k as f32 / steps as f32;
+                let a = a_start + (a_end - a_start) * t;
+                let cur = (cx + a.cos() * r, cy + a.sin() * r);
+                sf.thick_line(prev.0, prev.1, cur.0, cur.1, sw, c);
+                prev = cur;
+            }
+            let tx = -a_end.sin();
+            let ty = a_end.cos();
+            let nx = a_end.cos();
+            let ny = a_end.sin();
+            let head = 3.2 * s;
+            sf.thick_line(prev.0, prev.1, prev.0 - tx * head + nx * head * 0.55, prev.1 - ty * head + ny * head * 0.55, sw, c);
+            sf.thick_line(prev.0, prev.1, prev.0 - tx * head - nx * head * 0.75, prev.1 - ty * head - ny * head * 0.75, sw, c);
+        }
         Tab::Gestures => {
             sf.thick_line(cx - 6.5 * s, cy + 3.0 * s, cx - 1.5 * s, cy - 4.0 * s, sw, c);
             sf.thick_line(cx - 1.5 * s, cy - 4.0 * s, cx + 2.5 * s, cy + 2.5 * s, sw, c);
@@ -1337,6 +1472,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     let page_title = match dlg.tab {
         Tab::General => "常规设置",
         Tab::Folders => "自动发现文件夹",
+        Tab::Refresh => "扫描刷新",
         Tab::Gestures => "鼠标手势",
         Tab::About => "关于 WinLaunchpad",
     };
@@ -1390,6 +1526,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
     match dlg.tab {
         Tab::General => paint_tab_general(dlg, app, &l, &mut sf, dc, s),
         Tab::Folders => paint_tab_folders(dlg, app, &l, &mut sf, dc, s),
+        Tab::Refresh => paint_tab_refresh(dlg, app, &l, &mut sf, dc, s),
         Tab::Gestures => paint_tab_gestures(dlg, app, &l, &mut sf, dc, s),
         Tab::About => about::paint(dlg, &l.about, &mut sf, dc),
     }
@@ -1866,6 +2003,164 @@ fn gesture_card_specs(swap: bool, launchpad_hotkey: &str) -> [GestureCardSpec; 5
             tip: "按住右键先右下再右上：Win + Tab（任务视图）".into(),
         },
     ]
+}
+
+/// 绘制「扫描刷新」标签页：定时扫描间隔档位、展开静默刷新、事件驱动监听与状态卡片。
+fn paint_tab_refresh(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: windows::Win32::Graphics::Gdi::HDC, s: f32) {
+    // 定时扫描与展开刷新卡片
+    sf.fill_rrect(&l.refresh_timer_card, 10.0 * s, rgb(0xF8FAFC, 1.0));
+    sf.stroke_rrect(&l.refresh_timer_card, 10.0 * s, 1.0, rgb(0xE2E8F0, 1.0));
+    if dlg.hover == Hit::ToggleScanOnShow {
+        sf.fill_rrect(&l.refresh_on_show_row, 10.0 * s, rgb(0xF1F5F9, 0.7));
+    }
+    sf.fill_rect(
+        &RECT {
+            left: l.refresh_timer_card.left + (16.0 * s) as i32,
+            top: l.refresh_on_show_row.top,
+            right: l.refresh_timer_card.right - (16.0 * s) as i32,
+            bottom: l.refresh_on_show_row.top + 1,
+        },
+        rgb(0xE2E8F0, 1.0),
+    );
+
+    let active_secs = snap_scan_interval_secs(app.settings.scan_interval_secs);
+    let interval_idx = SCAN_INTERVAL_PRESETS
+        .iter()
+        .position(|&(secs, _)| secs == active_secs)
+        .unwrap_or(2);
+    let interval_labels: Vec<&str> = SCAN_INTERVAL_PRESETS.iter().map(|&(_, name)| name).collect();
+    draw_preset_group(
+        sf,
+        dc,
+        dlg,
+        &l.refresh_interval_row,
+        "定时扫描间隔",
+        &l.refresh_interval_presets,
+        &interval_labels,
+        interval_idx,
+        Hit::RefreshIntervalPreset,
+        s,
+    );
+
+    let show_lbl = RECT {
+        left: l.refresh_on_show_row.left + (18.0 * s) as i32,
+        top: l.refresh_on_show_row.top,
+        right: l.refresh_on_show_toggle.left - (12.0 * s) as i32,
+        bottom: l.refresh_on_show_row.bottom,
+    };
+    draw_text(dc, "展开启动台时后台刷新", dlg.font_body, &show_lbl, rgb(0x111827, 1.0), TextAlign::Left, true, false);
+    draw_toggle(
+        sf,
+        &l.refresh_on_show_toggle,
+        app.settings.scan_on_show,
+        dlg.hover == Hit::ToggleScanOnShow,
+        dlg.pressed == Hit::ToggleScanOnShow,
+        s,
+    );
+
+    // 安装/卸载事件驱动更新与图标缓存同步卡片
+    sf.fill_rrect(&l.refresh_event_card, 10.0 * s, rgb(0xF8FAFC, 1.0));
+    sf.stroke_rrect(&l.refresh_event_card, 10.0 * s, 1.0, rgb(0xE2E8F0, 1.0));
+    if dlg.hover == Hit::ToggleEventWatch {
+        sf.fill_rrect(&l.refresh_event_row, 10.0 * s, rgb(0xF1F5F9, 0.7));
+    }
+    if dlg.hover == Hit::ToggleRefreshChangedIcons {
+        sf.fill_rrect(&l.refresh_icons_row, 10.0 * s, rgb(0xF1F5F9, 0.7));
+    }
+    sf.fill_rect(
+        &RECT {
+            left: l.refresh_event_card.left + (16.0 * s) as i32,
+            top: l.refresh_icons_row.top,
+            right: l.refresh_event_card.right - (16.0 * s) as i32,
+            bottom: l.refresh_icons_row.top + 1,
+        },
+        rgb(0xE2E8F0, 1.0),
+    );
+
+    let ev_lbl = RECT {
+        left: l.refresh_event_row.left + (18.0 * s) as i32,
+        top: l.refresh_event_row.top,
+        right: l.refresh_event_toggle.left - (12.0 * s) as i32,
+        bottom: l.refresh_event_row.bottom,
+    };
+    let ic_lbl = RECT {
+        left: l.refresh_icons_row.left + (18.0 * s) as i32,
+        top: l.refresh_icons_row.top,
+        right: l.refresh_icons_toggle.left - (12.0 * s) as i32,
+        bottom: l.refresh_icons_row.bottom,
+    };
+    draw_text(dc, "安装 / 卸载事件驱动更新", dlg.font_body, &ev_lbl, rgb(0x111827, 1.0), TextAlign::Left, true, false);
+    draw_text(dc, "程序变更时自动更新图标", dlg.font_body, &ic_lbl, rgb(0x111827, 1.0), TextAlign::Left, true, false);
+    draw_toggle(
+        sf,
+        &l.refresh_event_toggle,
+        app.settings.event_watch_enabled,
+        dlg.hover == Hit::ToggleEventWatch,
+        dlg.pressed == Hit::ToggleEventWatch,
+        s,
+    );
+    draw_toggle(
+        sf,
+        &l.refresh_icons_toggle,
+        app.settings.refresh_changed_icons,
+        dlg.hover == Hit::ToggleRefreshChangedIcons,
+        dlg.pressed == Hit::ToggleRefreshChangedIcons,
+        s,
+    );
+
+    // 底部扫描状态与缓存操作卡片
+    sf.fill_rrect(&l.refresh_status_card, 10.0 * s, rgb(0xF8FAFC, 1.0));
+    sf.stroke_rrect(&l.refresh_status_card, 10.0 * s, 1.0, rgb(0xE2E8F0, 1.0));
+    let dot_cx = l.refresh_status_card.left as f32 + 22.0 * s;
+    let dot_cy = (l.refresh_status_card.top + l.refresh_status_card.bottom) as f32 * 0.5;
+    let dot_col = if app.scanning {
+        rgb(0x1677FF, 1.0)
+    } else if app.settings.event_watch_enabled && app.watcher.is_some() {
+        rgb(0x16A34A, 1.0)
+    } else {
+        rgb(0x94A3B8, 1.0)
+    };
+    sf.fill_circle(dot_cx, dot_cy, 4.2 * s, dot_col);
+
+    let status_text = if app.scanning {
+        "正在扫描应用…".to_string()
+    } else if !app.last_scan_time_text.is_empty() {
+        match app.last_scan_kind {
+            Some(k) => format!("最近扫描：{} · {}", app.last_scan_time_text, k.label()),
+            None => format!("最近扫描：{}", app.last_scan_time_text),
+        }
+    } else {
+        "等待首次扫描".to_string()
+    };
+    let status_rc = RECT {
+        left: l.refresh_status_card.left + (34.0 * s) as i32,
+        top: l.refresh_status_card.top,
+        right: l.refresh_rebuild_btn.left - (10.0 * s) as i32,
+        bottom: l.refresh_status_card.bottom,
+    };
+    draw_text(dc, &status_text, dlg.font_body, &status_rc, rgb(0x334155, 1.0), TextAlign::Left, true, false);
+    draw_button(
+        sf,
+        dc,
+        &l.refresh_rebuild_btn,
+        "重建图标缓存",
+        dlg.font_sub,
+        BtnStyle::Secondary,
+        dlg.hover == Hit::RebuildIconsCache,
+        dlg.pressed == Hit::RebuildIconsCache,
+        s,
+    );
+    draw_button(
+        sf,
+        dc,
+        &l.refresh_reset_btn,
+        "恢复默认",
+        dlg.font_sub,
+        BtnStyle::Secondary,
+        dlg.hover == Hit::RefreshReset,
+        dlg.pressed == Hit::RefreshReset,
+        s,
+    );
 }
 
 fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: windows::Win32::Graphics::Gdi::HDC, s: f32) {
@@ -2433,6 +2728,46 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         Hit::AddManualBtn => {
                             crate::add::open(app);
                         }
+                        Hit::RefreshIntervalPreset(i) => {
+                            if let Some(&(secs, _)) = SCAN_INTERVAL_PRESETS.get(i) {
+                                if app.settings.scan_interval_secs != secs {
+                                    app.settings.scan_interval_secs = secs;
+                                    app.store.save_settings(&app.settings);
+                                    app.sync_scan_timer();
+                                }
+                            }
+                        }
+                        Hit::ToggleScanOnShow => {
+                            app.settings.scan_on_show = !app.settings.scan_on_show;
+                            app.store.save_settings(&app.settings);
+                        }
+                        Hit::ToggleEventWatch => {
+                            app.settings.event_watch_enabled = !app.settings.event_watch_enabled;
+                            app.store.save_settings(&app.settings);
+                            app.sync_watcher();
+                        }
+                        Hit::ToggleRefreshChangedIcons => {
+                            app.settings.refresh_changed_icons = !app.settings.refresh_changed_icons;
+                            app.store.save_settings(&app.settings);
+                        }
+                        Hit::RebuildIconsCache => {
+                            app.rebuild_all_icons();
+                        }
+                        Hit::RefreshReset => {
+                            if app.settings.scan_interval_secs != 30
+                                || !app.settings.event_watch_enabled
+                                || app.settings.scan_on_show
+                                || !app.settings.refresh_changed_icons
+                            {
+                                app.settings.scan_interval_secs = 30;
+                                app.settings.event_watch_enabled = true;
+                                app.settings.scan_on_show = false;
+                                app.settings.refresh_changed_icons = true;
+                                app.store.save_settings(&app.settings);
+                                app.sync_scan_timer();
+                                app.sync_watcher();
+                            }
+                        }
                         Hit::ToggleGesture => {
                             let next = !app.settings.gestures_enabled;
                             app.apply_gestures(next);
@@ -2557,6 +2892,24 @@ mod tests {
             let (tw, _) = measure_text(dc, &spec.shortcut, font);
             assert!(tw > 0 && tw + 18 <= 173, "快捷键过宽: {} ({tw}px)", spec.shortcut);
         }
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        target.release();
+    }
+
+    #[test]
+    fn refresh_tab_labels_fit_buttons() {
+        let mut target = DibTarget::default();
+        assert!(target.ensure(240, 160));
+        let dc = target.mem_dc.expect("测试 DIB DC 应已创建");
+        let font = make_font(12, 400);
+        for &(_, label) in SCAN_INTERVAL_PRESETS {
+            let (tw, _) = measure_text(dc, label, font);
+            assert!(tw > 0 && tw + 10 <= 56, "扫描档位标签过宽: {label} ({tw}px)");
+        }
+        let (rw, _) = measure_text(dc, "重建图标缓存", font);
+        assert!(rw > 0 && rw + 14 <= 104, "重建图标缓存按钮过宽 ({rw}px)");
         unsafe {
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
