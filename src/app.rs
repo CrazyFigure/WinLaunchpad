@@ -1174,6 +1174,36 @@ impl App {
         }
     }
 
+    /// 通知已打开的设置窗口同步最新的可用更新状态。
+    fn notify_settings_update(&self) {
+        unsafe {
+            if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
+                let _ = PostMessageW(
+                    self.settings_hwnd,
+                    WM_APP_AUTO_UPDATE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    /// 清除等待启动台收起后再弹出的自动更新提醒标记。
+    pub fn clear_pending_update_popup(&mut self) {
+        self.pending_update_popup = false;
+    }
+
+    /// 同步手动检测更新弹窗所得结果：刷新可用更新缓存、自动检测计时并通知设置窗口。
+    pub fn sync_manual_update_result(&mut self, bundle: Option<crate::update::UpdateBundle>) {
+        self.last_auto_update_at = Some(SystemTime::now());
+        self.sync_auto_update_timer();
+        if let Some(ref b) = bundle {
+            self.auto_notified_version = Some(b.latest.version.clone());
+        }
+        self.available_update = bundle;
+        self.notify_settings_update();
+    }
+
     /// 处理后台自动更新检测结果：静默忽略错误，发现新版本时触发弹窗或等待启动台收起后弹出。
     fn on_auto_update_done(
         &mut self,
@@ -1189,16 +1219,7 @@ impl App {
             Ok((Some(bundle), _)) => {
                 let version = bundle.latest.version.clone();
                 self.available_update = Some(bundle.clone());
-                unsafe {
-                    if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
-                        let _ = PostMessageW(
-                            self.settings_hwnd,
-                            WM_APP_AUTO_UPDATE,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
+                self.notify_settings_update();
                 let popup_open = unsafe {
                     !self.update_hwnd.is_invalid() && IsWindow(self.update_hwnd).as_bool()
                 };
@@ -1214,16 +1235,7 @@ impl App {
             }
             Ok((None, _)) => {
                 self.available_update = None;
-                unsafe {
-                    if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
-                        let _ = PostMessageW(
-                            self.settings_hwnd,
-                            WM_APP_AUTO_UPDATE,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
-                }
+                self.notify_settings_update();
             }
             Err(err) => {
                 log::log(&format!("自动检测更新失败：{err}"));
@@ -2552,6 +2564,7 @@ impl App {
         match id {
             tray::CMD_TOGGLE => self.toggle(),
             tray::CMD_RESCAN => self.start_scan(),
+            tray::CMD_CHECK_UPDATE => crate::update_dialog::open_check(self),
             tray::CMD_SETTINGS => crate::settings::open(self),
             tray::CMD_EXIT => self.exit(),
             _ => {}

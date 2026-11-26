@@ -35,6 +35,7 @@ use crate::win32::{
 pub const CMD_TOGGLE: u32 = 1;
 pub const CMD_RESCAN: u32 = 2;
 pub const CMD_SETTINGS: u32 = 3;
+pub const CMD_CHECK_UPDATE: u32 = 4;
 pub const CMD_EXIT: u32 = 5;
 
 // 托盘菜单布局与视觉常量（dp 基准，按光标所在显示器 DPI 等比缩放）
@@ -55,7 +56,7 @@ struct TrayMenuItem {
     label: &'static str,
 }
 
-fn build_menu_items(visible: bool) -> [TrayMenuItem; 4] {
+fn build_menu_items(visible: bool) -> [TrayMenuItem; 5] {
     [
         TrayMenuItem {
             cmd: CMD_TOGGLE,
@@ -64,6 +65,11 @@ fn build_menu_items(visible: bool) -> [TrayMenuItem; 4] {
         TrayMenuItem {
             cmd: CMD_RESCAN,
             label: "刷新应用图标",
+        },
+        // 将检测更新置于设置上方，方便直接触发版本检查与更新弹窗
+        TrayMenuItem {
+            cmd: CMD_CHECK_UPDATE,
+            label: "检测更新",
         },
         // 托盘菜单仅保留常用操作入口，开机启动统一归入设置页管理
         TrayMenuItem {
@@ -216,7 +222,7 @@ fn render_menu_surface(
 struct MenuState {
     hwnd: HWND,
     owner: HWND,
-    items: [TrayMenuItem; 4],
+    items: [TrayMenuItem; 5],
     layout: MenuLayout,
     scale: f32,
     target: DibTarget,
@@ -671,20 +677,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_menu_places_check_update_above_settings() {
+        let items = build_menu_items(false);
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[2].cmd, CMD_CHECK_UPDATE);
+        assert_eq!(items[2].label, "检测更新");
+        assert_eq!(items[3].cmd, CMD_SETTINGS);
+        assert_eq!(items[3].label, "设置");
+        assert_eq!(items[4].cmd, CMD_EXIT);
+    }
+
+    #[test]
     fn tray_menu_layout_has_comfortable_row_height_and_continuous_hit_areas() {
-        let layout = MenuLayout::build(96, 4, 2.0);
-        assert_eq!(layout.item_rects.len(), 4);
-        assert_eq!(layout.hit_rects.len(), 4);
+        let layout = MenuLayout::build(96, 5, 2.0);
+        assert_eq!(layout.item_rects.len(), 5);
+        assert_eq!(layout.hit_rects.len(), 5);
         // 200% DPI 下每项高亮块高度 56px（28dp）、步进 60px（30dp），相比系统原生 ~42px 更舒展且保持紧致
         let item0_h = layout.item_rects[0].bottom - layout.item_rects[0].top;
         assert_eq!(item0_h, 56);
         let step = layout.item_rects[1].top - layout.item_rects[0].top;
         assert_eq!(step, 60);
-        assert_eq!(layout.hit_rects[0].bottom, layout.hit_rects[1].top);
-        assert_eq!(layout.hit_rects[1].bottom, layout.hit_rects[2].top);
-        assert_eq!(layout.hit_rects[2].bottom, layout.hit_rects[3].top);
+        for i in 0..4 {
+            assert_eq!(layout.hit_rects[i].bottom, layout.hit_rects[i + 1].top);
+        }
         assert_eq!(layout.hit(layout.w / 2, layout.hit_rects[0].bottom - 1), Some(0));
         assert_eq!(layout.hit(layout.w / 2, layout.hit_rects[1].top), Some(1));
+        assert_eq!(layout.hit(layout.w / 2, layout.hit_rects[4].bottom - 1), Some(4));
     }
 
     #[test]
