@@ -24,7 +24,13 @@ pub const WM_APP_GESTURE_HUD: u32 = WM_APP + 9;
 const MSG_ENABLE: u32 = WM_APP + 20;
 const MSG_DISABLE: u32 = WM_APP + 21;
 const MSG_REINSTALL: u32 = WM_APP + 22;
+// 使用独立魔数标记本程序 SendInput 回放事件，仅放行自身注入而不屏蔽远控软件输入
+#[cfg(target_pointer_width = "64")]
+const MAGIC_EXTRA: usize = 0x574C_5041_4745_5354;
+#[cfg(not(target_pointer_width = "64"))]
 const MAGIC_EXTRA: usize = 0x574C_5041;
+/// 回放防回声时间窗口（毫秒）：防止与其他右键手势钩子共存时互相吞放陷入死循环
+const REPLAY_ECHO_WINDOW_MS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gesture {
@@ -151,27 +157,184 @@ pub fn take_trail_snapshot() -> TrailSnapshot {
         .unwrap_or_default()
 }
 
+/// 触发手势回放的裁决结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseOutcome {
+    /// 未处于手势跟踪中，直接放行给后续钩子。
+    Passthrough,
+    /// 成功识别为指定手势（携带是否曾激活过轨迹浮窗）。
+    Recognized { gesture: Gesture, hide_hud: bool },
+    /// 未识别出手势，需异步回放一次普通右键（携带是否曾激活过轨迹浮窗）。
+    ReplayClick { hide_hud: bool },
+}
+
+/// 判断鼠标事件是否由本程序自身调用 SendInput 产生，避免回放事件再次触发钩子。
+#[inline]
+fn is_self_injected(flags: u32, extra_info: usize) -> bool {
+    (flags & LLMHF_INJECTED) != 0 && extra_info == MAGIC_EXTRA
+}
+
+/// 判断外部注入的右键按下是否属于刚回放右键后同位置的极短时回声。
+#[inline]
+fn is_recent_replay_echo(
+    flags: u32,
+    pt: POINT,
+    now_tick: u64,
+    last_replay_tick: u64,
+    last_replay_pt: POINT,
+) -> bool {
+    if (flags & LLMHF_INJECTED) == 0 || last_replay_tick == 0 {
+        return false;
+    }
+    now_tick.saturating_sub(last_replay_tick) <= REPLAY_ECHO_WINDOW_MS
+        && (pt.x - last_replay_pt.x).abs() <= 2
+        && (pt.y - last_replay_pt.y).abs() <= 2
+}
+
 #[derive(Default)]
 struct State {
     tracking: bool,
     moved: bool,
+    hud_shown: bool,
     dpi_scale: f32,
     start: POINT,
     last: POINT,
     last_trail: POINT,
     pts: Vec<POINT>,
     trail: Vec<POINT>,
+    last_replay_tick: u64,
+    last_replay_pt: POINT,
+}
+
+impl State {
+    /// 开始一次右键手势采样；若命中短时回放防回声窗口则返回 None 表示直接放行。
+    fn on_rbutton_down(
+        &mut self,
+        pt: POINT,
+        flags: u32,
+        now_tick: u64,
+        sample_dpi_scale: impl FnOnce() -> f32,
+    ) -> Option<bool> {
+        if is_recent_replay_echo(flags, pt, now_tick, self.last_replay_tick, self.last_replay_pt) {
+            return None;
+        }
+        let had_stale_hud = self.hud_shown;
+        self.tracking = true;
+        self.moved = false;
+        self.hud_shown = false;
+        self.dpi_scale = sample_dpi_scale().max(1.0);
+        self.pts.clear();
+        self.pts.push(pt);
+        self.trail.clear();
+        self.trail.push(pt);
+        self.start = pt;
+        self.last = pt;
+        self.last_trail = pt;
+        Some(had_stale_hud)
+    }
+
+    /// 采样鼠标移动点；越过死区后标记轨迹激活并生成实时轨迹浮窗快照。
+    fn on_mouse_move(&mut self, pt: POINT, threshold: u8) -> Option<TrailSnapshot> {
+        if !self.tracking {
+            return None;
+        }
+        let tdx = (pt.x - self.last_trail.x) as f32;
+        let tdy = (pt.y - self.last_trail.y) as f32;
+        let mut trail_updated = false;
+        // 每移动约 3px 采集一个高密度渲染点，确保实时手势曲线平滑无棱角
+        if tdx * tdx + tdy * tdy >= 9.0 {
+            if self.trail.len() >= 512 {
+                compact_points(&mut self.trail);
+            }
+            self.trail.push(pt);
+            self.last_trail = pt;
+            trail_updated = true;
+        }
+        let dx = (pt.x - self.last.x) as f32;
+        let dy = (pt.y - self.last.y) as f32;
+        if dx * dx + dy * dy >= 49.0 {
+            if self.pts.len() >= 256 {
+                compact_points(&mut self.pts);
+            }
+            self.pts.push(pt);
+            self.last = pt;
+        }
+        if !self.moved {
+            let sdx = (pt.x - self.start.x) as f32;
+            let sdy = (pt.y - self.start.y) as f32;
+            let deadzone = 16.0 * self.dpi_scale.max(1.0);
+            if sdx * sdx + sdy * sdy >= deadzone * deadzone {
+                self.moved = true;
+                trail_updated = true;
+            }
+        }
+        if self.moved && trail_updated {
+            self.hud_shown = true;
+            let cur = recognize_pts_with(&self.pts, threshold, self.dpi_scale);
+            Some(TrailSnapshot {
+                active: true,
+                pts: self.trail.clone(),
+                cursor: pt,
+                gesture: cur,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// 结束一次右键采样并裁决执行手势或回放普通右键。
+    fn on_rbutton_up(&mut self, pt: POINT, threshold: u8, now_tick: u64) -> ReleaseOutcome {
+        if !self.tracking {
+            return ReleaseOutcome::Passthrough;
+        }
+        self.tracking = false;
+        let hide_hud = self.hud_shown;
+        self.hud_shown = false;
+
+        // 兼容远控软件在高延迟下合并移动事件，松开时补做一次死区判定
+        if !self.moved {
+            let sdx = (pt.x - self.start.x) as f32;
+            let sdy = (pt.y - self.start.y) as f32;
+            let deadzone = 16.0 * self.dpi_scale.max(1.0);
+            if sdx * sdx + sdy * sdy >= deadzone * deadzone {
+                self.moved = true;
+            }
+        }
+
+        let rec = if self.moved {
+            self.pts.push(pt);
+            self.trail.push(pt);
+            recognize_pts_with(&self.pts, threshold, self.dpi_scale)
+        } else {
+            None
+        };
+        self.moved = false;
+        self.pts.clear();
+        self.trail.clear();
+
+        match rec {
+            Some(gesture) => ReleaseOutcome::Recognized { gesture, hide_hud },
+            None => {
+                self.last_replay_tick = now_tick.max(1);
+                self.last_replay_pt = pt;
+                ReleaseOutcome::ReplayClick { hide_hud }
+            }
+        }
+    }
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     tracking: false,
     moved: false,
+    hud_shown: false,
     dpi_scale: 1.0,
     start: POINT { x: 0, y: 0 },
     last: POINT { x: 0, y: 0 },
     last_trail: POINT { x: 0, y: 0 },
     pts: Vec::new(),
     trail: Vec::new(),
+    last_replay_tick: 0,
+    last_replay_pt: POINT { x: 0, y: 0 },
 });
 
 pub struct GestureHandle {
@@ -321,9 +484,11 @@ fn reset_state() {
     if let Ok(mut st) = STATE.lock() {
         st.tracking = false;
         st.moved = false;
+        st.hud_shown = false;
         st.dpi_scale = 1.0;
         st.pts.clear();
         st.trail.clear();
+        st.last_replay_tick = 0;
     }
     if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
         snap.active = false;
@@ -692,14 +857,29 @@ fn compact_points(pts: &mut Vec<POINT>) {
     *pts = kept;
 }
 
+/// 清空实时轨迹浮窗快照并通知主线程隐藏浮窗。
+fn clear_hud_snapshot(main: HWND) {
+    if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
+        snap.active = false;
+        snap.pts.clear();
+        snap.gesture = None;
+    }
+    TRAIL_DIRTY.store(true, Ordering::Release);
+    unsafe {
+        let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(0), LPARAM(0));
+    }
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
     // 每次进入回调即刷新心跳时间戳，供主线程检测系统是否静默摘除了低级钩子
-    LAST_HOOK_TICK.store(GetTickCount64(), Ordering::Relaxed);
+    let now_tick = GetTickCount64();
+    LAST_HOOK_TICK.store(now_tick, Ordering::Relaxed);
     let mi = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-    if mi.flags & LLMHF_INJECTED != 0 {
+    // 仅放行本程序自身回放的右键事件；UU 远程等远控软件注入的鼠标事件同样参与手势识别
+    if is_self_injected(mi.flags, mi.dwExtraInfo) {
         return CallNextHookEx(None, code, wparam, lparam);
     }
     let msg = wparam.0 as u32;
@@ -709,79 +889,27 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0 {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
-            // 按下时采样当前显示器 DPI 缩放，保证不同缩放倍率屏幕下的有效行程一致
-            let dpi_scale = (crate::win32::dpi_at_point(mi.pt.x, mi.pt.y) as f32 / 96.0).max(1.0);
-            let mut had_stale_trail = false;
-            if let Ok(mut st) = STATE.lock() {
-                had_stale_trail = st.moved;
-                st.tracking = true;
-                st.moved = false;
-                st.dpi_scale = dpi_scale;
-                st.pts.clear();
-                st.pts.push(mi.pt);
-                st.trail.clear();
-                st.trail.push(mi.pt);
-                st.start = mi.pt;
-                st.last = mi.pt;
-                st.last_trail = mi.pt;
-            }
-            if had_stale_trail {
-                if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
-                    snap.active = false;
-                    snap.pts.clear();
-                    snap.gesture = None;
-                }
-                TRAIL_DIRTY.store(true, Ordering::Release);
-                let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(0), LPARAM(0));
+            let down_res = match STATE.lock() {
+                Ok(mut st) => st.on_rbutton_down(mi.pt, mi.flags, now_tick, || {
+                    // 按下时采样当前显示器 DPI 缩放，保证不同缩放倍率屏幕下的有效行程一致
+                    (crate::win32::dpi_at_point(mi.pt.x, mi.pt.y) as f32 / 96.0).max(1.0)
+                }),
+                Err(_) => return CallNextHookEx(None, code, wparam, lparam),
+            };
+            let Some(had_stale_hud) = down_res else {
+                return CallNextHookEx(None, code, wparam, lparam);
+            };
+            if had_stale_hud {
+                clear_hud_snapshot(main);
             }
             LRESULT(1)
         }
         WM_MOUSEMOVE => {
-            let mut next_snap: Option<TrailSnapshot> = None;
-            if let Ok(mut st) = STATE.lock() {
-                if st.tracking {
-                    let tdx = (mi.pt.x - st.last_trail.x) as f32;
-                    let tdy = (mi.pt.y - st.last_trail.y) as f32;
-                    let mut trail_updated = false;
-                    // 每移动约 3px 采集一个高密度渲染点，确保实时手势曲线平滑无棱角
-                    if tdx * tdx + tdy * tdy >= 9.0 {
-                        if st.trail.len() >= 512 {
-                            compact_points(&mut st.trail);
-                        }
-                        st.trail.push(mi.pt);
-                        st.last_trail = mi.pt;
-                        trail_updated = true;
-                    }
-                    let dx = (mi.pt.x - st.last.x) as f32;
-                    let dy = (mi.pt.y - st.last.y) as f32;
-                    if dx * dx + dy * dy >= 49.0 {
-                        if st.pts.len() >= 256 {
-                            compact_points(&mut st.pts);
-                        }
-                        st.pts.push(mi.pt);
-                        st.last = mi.pt;
-                    }
-                    if !st.moved {
-                        let sdx = (mi.pt.x - st.start.x) as f32;
-                        let sdy = (mi.pt.y - st.start.y) as f32;
-                        let deadzone = 16.0 * st.dpi_scale.max(1.0);
-                        if sdx * sdx + sdy * sdy >= deadzone * deadzone {
-                            st.moved = true;
-                            trail_updated = true;
-                        }
-                    }
-                    if st.moved && trail_updated {
-                        let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
-                        let cur = recognize_pts_with(&st.pts, threshold, st.dpi_scale);
-                        next_snap = Some(TrailSnapshot {
-                            active: true,
-                            pts: st.trail.clone(),
-                            cursor: mi.pt,
-                            gesture: cur,
-                        });
-                    }
-                }
-            }
+            let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
+            let next_snap = STATE
+                .lock()
+                .ok()
+                .and_then(|mut st| st.on_mouse_move(mi.pt, threshold));
             // 先释放 STATE 锁，再更新渲染快照与投递合并通知，绝不在锁内调用系统消息 API
             if let Some(s) = next_snap {
                 if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
@@ -797,52 +925,29 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             CallNextHookEx(None, code, wparam, lparam)
         }
         WM_RBUTTONUP => {
-            let (was_tracking, had_trail, g) = match STATE.lock() {
-                Ok(mut st) => {
-                    if !st.tracking {
-                        (false, false, None)
-                    } else {
-                        st.tracking = false;
-                        let had = st.moved;
-                        if had {
-                            st.pts.push(mi.pt);
-                            st.trail.push(mi.pt);
-                        }
-                        let rec = if had {
-                            let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
-                            recognize_pts_with(&st.pts, threshold, st.dpi_scale)
-                        } else {
-                            None
-                        };
-                        st.pts.clear();
-                        st.trail.clear();
-                        (true, had, rec)
-                    }
-                }
-                Err(_) => (false, false, None),
+            let threshold = GESTURE_THRESHOLD_PCT.load(Ordering::Relaxed);
+            let outcome = match STATE.lock() {
+                Ok(mut st) => st.on_rbutton_up(mi.pt, threshold, now_tick),
+                Err(_) => ReleaseOutcome::Passthrough,
             };
-            if !was_tracking {
-                return CallNextHookEx(None, code, wparam, lparam);
-            }
-            if had_trail {
-                if let Ok(mut snap) = TRAIL_SNAPSHOT.lock() {
-                    snap.active = false;
-                    snap.pts.clear();
-                    snap.gesture = None;
+            match outcome {
+                ReleaseOutcome::Passthrough => CallNextHookEx(None, code, wparam, lparam),
+                ReleaseOutcome::Recognized { gesture, hide_hud } => {
+                    if hide_hud {
+                        clear_hud_snapshot(main);
+                    }
+                    let _ = PostMessageW(main, WM_APP_GESTURE, WPARAM(gesture.id()), LPARAM(0));
+                    LRESULT(1)
                 }
-                TRAIL_DIRTY.store(true, Ordering::Release);
-                let _ = PostMessageW(main, WM_APP_GESTURE_HUD, WPARAM(0), LPARAM(0));
-            }
-            match g {
-                Some(g) => {
-                    let _ = PostMessageW(main, WM_APP_GESTURE, WPARAM(g.id()), LPARAM(0));
-                }
-                None => {
+                ReleaseOutcome::ReplayClick { hide_hud } => {
+                    if hide_hud {
+                        clear_hud_snapshot(main);
+                    }
                     // 通过独立发送线程回放右键，避免钩子回调内阻塞于 SendInput
                     let _ = sender_tx().send(SenderCmd::ReplayRightClick);
+                    LRESULT(1)
                 }
             }
-            LRESULT(1)
         }
         _ => CallNextHookEx(None, code, wparam, lparam),
     }
@@ -931,5 +1036,100 @@ mod tests {
         assert_eq!(pts[0], first);
         assert_eq!(*pts.last().unwrap(), last);
         assert!(pts.len() < 20);
+    }
+
+    #[test]
+    fn filters_only_self_injected_events() {
+        // 物理硬件输入与 UU 远程等远控注入输入均需进入手势识别，仅自身 MAGIC_EXTRA 回放直接放行
+        assert!(!is_self_injected(0, 0));
+        assert!(!is_self_injected(LLMHF_INJECTED, 0));
+        assert!(!is_self_injected(LLMHF_INJECTED | 0x02, 0x1234));
+        assert!(!is_self_injected(0, MAGIC_EXTRA));
+        assert!(is_self_injected(LLMHF_INJECTED, MAGIC_EXTRA));
+    }
+
+    #[test]
+    fn remote_injected_gestures_and_clicks_work() {
+        let mut st = State::default();
+
+        // 1. 模拟 UU 远程注入右键滑动（带 LLMHF_INJECTED）：正常采样轨迹并识别手势
+        assert_eq!(
+            st.on_rbutton_down(pt(500, 500), LLMHF_INJECTED, 1000, || 1.0),
+            Some(false)
+        );
+        assert!(st.on_mouse_move(pt(460, 500), 70).is_some());
+        let snap = st.on_mouse_move(pt(380, 500), 70).unwrap();
+        assert!(snap.active);
+        assert_eq!(snap.gesture, Some(Gesture::Left));
+        assert_eq!(
+            st.on_rbutton_up(pt(380, 500), 70, 1080),
+            ReleaseOutcome::Recognized {
+                gesture: Gesture::Left,
+                hide_hud: true,
+            }
+        );
+
+        // 2. 模拟远控普通右键点击（微小抖动未过死区）：松开时回放普通右键
+        assert_eq!(
+            st.on_rbutton_down(pt(500, 500), LLMHF_INJECTED, 2000, || 1.0),
+            Some(false)
+        );
+        assert!(st.on_mouse_move(pt(504, 503), 70).is_none());
+        assert_eq!(
+            st.on_rbutton_up(pt(504, 503), 70, 2060),
+            ReleaseOutcome::ReplayClick { hide_hud: false }
+        );
+
+        // 3. 模拟远控高延迟下丢弃中间 MOVE 的快速左划：松开时补做死区判定并识别手势
+        assert_eq!(
+            st.on_rbutton_down(pt(600, 400), LLMHF_INJECTED, 3000, || 1.0),
+            Some(false)
+        );
+        assert_eq!(
+            st.on_rbutton_up(pt(450, 400), 70, 3030),
+            ReleaseOutcome::Recognized {
+                gesture: Gesture::Left,
+                hide_hud: false,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_echo_guard_breaks_ping_pong_without_blocking_normal_use() {
+        let mut st = State::default();
+        assert_eq!(
+            st.on_rbutton_down(pt(300, 300), LLMHF_INJECTED, 1000, || 1.0),
+            Some(false)
+        );
+        assert_eq!(
+            st.on_rbutton_up(pt(300, 300), 70, 1020),
+            ReleaseOutcome::ReplayClick { hide_hud: false }
+        );
+
+        // 刚回放后同位置极短时间内的外部注入按下直接放行，避免与第三方钩子反复吞放
+        assert_eq!(
+            st.on_rbutton_down(pt(301, 300), LLMHF_INJECTED, 1035, || 1.0),
+            None
+        );
+        assert_eq!(st.on_rbutton_up(pt(301, 300), 70, 1036), ReleaseOutcome::Passthrough);
+
+        // 物理鼠标点击或换位置 / 超过防回声窗口后的远控输入均正常接管
+        assert_eq!(st.on_rbutton_down(pt(300, 300), 0, 1035, || 1.0), Some(false));
+        assert_eq!(
+            st.on_rbutton_up(pt(300, 300), 70, 1045),
+            ReleaseOutcome::ReplayClick { hide_hud: false }
+        );
+        assert_eq!(
+            st.on_rbutton_down(pt(340, 300), LLMHF_INJECTED, 1050, || 1.0),
+            Some(false)
+        );
+        assert_eq!(
+            st.on_rbutton_up(pt(340, 300), 70, 1070),
+            ReleaseOutcome::ReplayClick { hide_hud: false }
+        );
+        assert_eq!(
+            st.on_rbutton_down(pt(340, 300), LLMHF_INJECTED, 1140, || 1.0),
+            Some(false)
+        );
     }
 }
