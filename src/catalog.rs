@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use windows::core::{w, GUID, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
-use windows::Win32::Globalization::{CompareStringW, GetUserDefaultLCID, CSTR_GREATER_THAN, CSTR_LESS_THAN};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, IPersistFile, STGM_READ,
@@ -186,18 +185,9 @@ fn is_aux(display_name: &str, target: &str, args: &str, mode: Filter) -> bool {
     false
 }
 
-/// 名称排序：交给系统区域规则（中文按拼音），忽略大小写。
+/// 名称排序：中英文统一按拼音/字母顺序排序（忽略大小写），同音字回退中文区域比较。
 pub fn cmp_names(a: &str, b: &str) -> std::cmp::Ordering {
-    let la: Vec<u16> = a.encode_utf16().collect();
-    let lb: Vec<u16> = b.encode_utf16().collect();
-    let r = unsafe { CompareStringW(GetUserDefaultLCID(), 1, &la, &lb) };
-    if r == CSTR_LESS_THAN {
-        std::cmp::Ordering::Less
-    } else if r == CSTR_GREATER_THAN {
-        std::cmp::Ordering::Greater
-    } else {
-        a.cmp(b)
-    }
+    crate::pinyin::cmp_mixed_names(a, b)
 }
 
 // ---------- 文件夹分类与默认可见策略 ----------
@@ -816,13 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn sort_puts_latin_before_cjk() {
+    fn sort_mixes_latin_and_cjk_alphabetically() {
         assert_eq!(cmp_names("Alpha", "Beta"), std::cmp::Ordering::Less);
-        let names = ["微信", "Chrome", "计算器", "7-Zip"];
+        let names = ["微信", "Chrome", "计算器", "7-Zip", "爱奇艺", "钉钉", "Zoom"];
         let mut sorted = names.to_vec();
         sorted.sort_by(|a, b| cmp_names(a, b));
-        assert_eq!(sorted[0], "7-Zip");
-        assert_eq!(sorted[1], "Chrome");
+        assert_eq!(
+            sorted,
+            ["7-Zip", "爱奇艺", "Chrome", "钉钉", "计算器", "微信", "Zoom"]
+        );
     }
 
     #[test]

@@ -73,6 +73,38 @@ struct CategoryGroup {
 enum TreeRow {
     Folder { sub_idx: usize },
     App { sub_idx: usize, entry_idx: usize, indented: bool },
+    CheckedApp { checked_idx: usize },
+}
+
+#[derive(Clone)]
+struct CheckedRowItem {
+    entry: AppEntry,
+    folder_name: String,
+    is_manual: bool,
+}
+
+/// 收集当前所有已勾选并在启动台展示的应用（含手动添加条目），按中英文拼音字母排序。
+fn collect_checked_items(scan_entries: &[AppEntry], settings: &crate::config::Settings) -> Vec<CheckedRowItem> {
+    let mut out = Vec::new();
+    for e in scan_entries {
+        if catalog::is_entry_visible(e, settings) {
+            let (_, folder_name) = catalog::resolve_folder(e);
+            out.push(CheckedRowItem {
+                entry: e.clone(),
+                folder_name,
+                is_manual: false,
+            });
+        }
+    }
+    for e in &settings.manual {
+        out.push(CheckedRowItem {
+            entry: e.clone(),
+            folder_name: "手动添加的应用".into(),
+            is_manual: true,
+        });
+    }
+    out.sort_by(|a, b| catalog::cmp_names(&a.entry.name, &b.entry.name));
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,6 +132,8 @@ enum Hit {
     // 应用与文件夹
     FolderResetDefault,
     FolderSelectAll,
+    ToggleCheckedOnly,
+    RefreshCheckedList,
     FolderSearchBox,
     CategoryRow(usize),
     CategoryCheck(usize),
@@ -155,6 +189,8 @@ struct Dlg {
     hk_msg: Option<String>,
     categories: Vec<CategoryGroup>,
     selected_cat: usize,
+    show_checked_only: bool,
+    checked_items: Vec<CheckedRowItem>,
     expanded_folders: HashSet<String>,
     tree_rows: Vec<TreeRow>,
     cat_scroll: usize,
@@ -213,6 +249,8 @@ struct Layout {
     search_edit_rc: RECT,
     btn_reset_def: RECT,
     btn_all_folders: RECT,
+    checked_only_row: RECT,
+    checked_only_toggle: RECT,
     folder_list_rc: RECT,
     folder_scroll_rc: RECT,
     folder_row_h: i32,
@@ -220,6 +258,7 @@ struct Layout {
     right_header: RECT,
     btn_folder_all: RECT,
     btn_tree_expand: RECT,
+    btn_refresh_checked: RECT,
     btn_add_manual: RECT,
     btn_exp_back: RECT,
     btn_exp_del_all: RECT,
@@ -429,7 +468,16 @@ impl Dlg {
         let qbw = (lw - s(28.0)) / 2;
         let btn_all_folders = RECT { left: left_pane.left + s(10.0), top: search_box.bottom + s(8.0), right: left_pane.left + s(10.0) + qbw, bottom: search_box.bottom + s(34.0) };
         let btn_reset_def = RECT { left: btn_all_folders.right + s(8.0), top: btn_all_folders.top, right: left_pane.right - s(10.0), bottom: btn_all_folders.bottom };
-        let folder_list_rc = RECT { left: left_pane.left + s(6.0), top: btn_all_folders.bottom + s(8.0), right: left_pane.right - s(12.0), bottom: left_pane.bottom - s(8.0) };
+        let checked_only_row = RECT { left: left_pane.left + s(10.0), top: btn_all_folders.bottom + s(8.0), right: left_pane.right - s(10.0), bottom: btn_all_folders.bottom + s(40.0) };
+        let ctw = s(38.0);
+        let cth = s(20.0);
+        let checked_only_toggle = RECT {
+            left: checked_only_row.right - s(8.0) - ctw,
+            top: checked_only_row.top + ((checked_only_row.bottom - checked_only_row.top) - cth) / 2,
+            right: checked_only_row.right - s(8.0),
+            bottom: checked_only_row.top + ((checked_only_row.bottom - checked_only_row.top) + cth) / 2,
+        };
+        let folder_list_rc = RECT { left: left_pane.left + s(6.0), top: checked_only_row.bottom + s(10.0), right: left_pane.right - s(12.0), bottom: left_pane.bottom - s(8.0) };
         let folder_scroll_rc = RECT { left: left_pane.right - s(9.0), top: folder_list_rc.top, right: left_pane.right - s(3.0), bottom: folder_list_rc.bottom };
         let folder_row_h = s(38.0);
         let folder_vis = ((folder_list_rc.bottom - folder_list_rc.top) / folder_row_h).max(1) as usize;
@@ -437,6 +485,7 @@ impl Dlg {
         let right_header = RECT { left: right_pane.left, top: right_pane.top, right: right_pane.right, bottom: right_pane.top + s(44.0) };
         let btn_folder_all = RECT { left: right_header.right - s(14.0) - s(76.0), top: right_header.top + s(8.0), right: right_header.right - s(14.0), bottom: right_header.bottom - s(8.0) };
         let btn_tree_expand = RECT { left: btn_folder_all.left - s(8.0) - s(76.0), top: right_header.top + s(8.0), right: btn_folder_all.left - s(8.0), bottom: right_header.bottom - s(8.0) };
+        let btn_refresh_checked = RECT { left: right_header.right - s(14.0) - s(76.0), top: right_header.top + s(8.0), right: right_header.right - s(14.0), bottom: right_header.bottom - s(8.0) };
         let btn_add_manual = RECT { left: right_header.right - s(14.0) - s(98.0), top: right_header.top + s(8.0), right: right_header.right - s(14.0), bottom: right_header.bottom - s(8.0) };
         let btn_exp_del_all = RECT { left: right_header.right - s(14.0) - s(104.0), top: right_header.top + s(8.0), right: right_header.right - s(14.0), bottom: right_header.bottom - s(8.0) };
         let btn_exp_back = RECT { left: btn_exp_del_all.left - s(8.0) - s(64.0), top: right_header.top + s(8.0), right: btn_exp_del_all.left - s(8.0), bottom: right_header.bottom - s(8.0) };
@@ -515,8 +564,9 @@ impl Dlg {
             grid_card, icon_row, icon_presets, round_row, round_presets, cols_row, cols_auto_btn, cols_dec_btn, cols_val_rc, cols_inc_btn,
             rows_row, rows_auto_btn, rows_dec_btn, rows_val_rc, rows_inc_btn, layout_reset_btn,
             left_pane, right_pane, search_box, search_edit_rc, btn_reset_def, btn_all_folders,
+            checked_only_row, checked_only_toggle,
             folder_list_rc, folder_scroll_rc, folder_row_h, folder_vis, right_header,
-            btn_folder_all, btn_tree_expand, btn_add_manual, btn_exp_back, btn_exp_del_all,
+            btn_folder_all, btn_tree_expand, btn_refresh_checked, btn_add_manual, btn_exp_back, btn_exp_del_all,
             app_list_rc, app_scroll_rc, app_row_h, app_vis, exp_row_h, exp_vis,
             gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle,
             gesture_row3, gesture_thresh_def_btn, gesture_thresh_dec_btn, gesture_thresh_val_rc, gesture_thresh_inc_btn,
@@ -596,7 +646,12 @@ impl Dlg {
         } else {
             self.selected_cat = 0;
         }
+        self.rebuild_checked_items(app);
         self.rebuild_tree();
+    }
+
+    fn rebuild_checked_items(&mut self, app: &App) {
+        self.checked_items = collect_checked_items(&app.scan.entries, &app.settings);
     }
 
     fn search_query(&self) -> String {
@@ -621,10 +676,24 @@ impl Dlg {
             })
     }
 
-    /// 按当前选中的大类与筛选词重建右侧树形可视行列表。
+    /// 按当前选中的大类（或已勾选图标模式）与筛选词重建右侧树形可视行列表。
     fn rebuild_tree(&mut self) {
         self.tree_rows.clear();
         let q = self.search_query().trim().to_lowercase();
+        if self.show_checked_only {
+            for (ci, item) in self.checked_items.iter().enumerate() {
+                if q.is_empty()
+                    || item.entry.name.to_lowercase().contains(&q)
+                    || item.folder_name.to_lowercase().contains(&q)
+                {
+                    self.tree_rows.push(TreeRow::CheckedApp { checked_idx: ci });
+                }
+            }
+            if self.app_scroll >= self.tree_rows.len() {
+                self.app_scroll = self.tree_rows.len().saturating_sub(1);
+            }
+            return;
+        }
         let Some(cat) = self.categories.get(self.selected_cat) else { return };
 
         if !cat.is_tree {
@@ -678,7 +747,7 @@ impl Dlg {
 
     fn on_search_changed(&mut self) {
         let q = self.search_query().trim().to_lowercase();
-        if !q.is_empty() {
+        if !q.is_empty() && !self.show_checked_only {
             if let Some(cur) = self.categories.get(self.selected_cat) {
                 if !self.category_matches_query(cur, &q) {
                     if let Some(idx) = self.categories.iter().position(|c| self.category_matches_query(c, &q)) {
@@ -843,6 +912,17 @@ impl Dlg {
         if self.tab != Tab::Folders {
             return;
         }
+        if self.show_checked_only {
+            for vi in 0..l.app_vis {
+                let idx = self.app_scroll + vi;
+                if let Some(TreeRow::CheckedApp { checked_idx }) = self.tree_rows.get(idx) {
+                    if let Some(item) = self.checked_items.get(*checked_idx) {
+                        app.request_icon_async(&item.entry.icon_key);
+                    }
+                }
+            }
+            return;
+        }
         let Some(cat) = self.categories.get(self.selected_cat) else { return };
         for vi in 0..l.app_vis {
             let idx = self.app_scroll + vi;
@@ -1001,6 +1081,9 @@ impl Dlg {
                 if inside(&l.btn_reset_def, x, y) {
                     return Hit::FolderResetDefault;
                 }
+                if inside(&l.checked_only_toggle, x, y) || inside(&l.checked_only_row, x, y) {
+                    return Hit::ToggleCheckedOnly;
+                }
                 if inside(&l.folder_list_rc, x, y) {
                     for vi in 0..l.folder_vis {
                         let ci = self.cat_scroll + vi;
@@ -1041,6 +1124,32 @@ impl Dlg {
                                     return Hit::ExpiredDeleteOne(idx);
                                 }
                                 return Hit::ExpiredRow(idx);
+                            }
+                        }
+                    }
+                } else if self.show_checked_only {
+                    if inside(&l.btn_refresh_checked, x, y) {
+                        return Hit::RefreshCheckedList;
+                    }
+                    if inside(&l.app_list_rc, x, y) {
+                        for vi in 0..l.app_vis {
+                            let idx = self.app_scroll + vi;
+                            let Some(TreeRow::CheckedApp { checked_idx }) = self.tree_rows.get(idx) else {
+                                continue;
+                            };
+                            let (row, _, _) = self.tree_row_rects(l, vi, false);
+                            if inside(&row, x, y) {
+                                if self
+                                    .checked_items
+                                    .get(*checked_idx)
+                                    .is_some_and(|item| item.is_manual)
+                                {
+                                    let action = self.manual_remove_rect(&row);
+                                    if inside(&action, x, y) {
+                                        return Hit::AppRemoveManual(idx);
+                                    }
+                                }
+                                return Hit::TreeRowItem(idx);
                             }
                         }
                     }
@@ -1089,6 +1198,7 @@ impl Dlg {
                                         return Hit::TreeRowItem(idx);
                                     }
                                 }
+                                TreeRow::CheckedApp { .. } => {}
                             }
                         }
                     }
@@ -1188,6 +1298,8 @@ pub fn open(app: &mut App) {
             hk_msg: None,
             categories: Vec::new(),
             selected_cat: 0,
+            show_checked_only: false,
+            checked_items: Vec::new(),
             expanded_folders: HashSet::new(),
             tree_rows: Vec::new(),
             cat_scroll: 0,
@@ -1290,6 +1402,16 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
             Some((hit, rc, format!("恢复按当前屏幕分辨率自适应（推荐 {ac}×{ar}）")))
         }
         Hit::LayoutReset => Some((Hit::LayoutReset, l.layout_reset_btn, "将图标大小、圆角圆润度与网格行列全部恢复为默认值".into())),
+        Hit::ToggleCheckedOnly => Some((
+            Hit::ToggleCheckedOnly,
+            l.checked_only_row,
+            "切换查看当前所有已勾选显示在启动台中的应用".into(),
+        )),
+        Hit::RefreshCheckedList => Some((
+            Hit::RefreshCheckedList,
+            l.btn_refresh_checked,
+            "刷新当前已勾选图标列表".into(),
+        )),
         Hit::CategoryRow(ci) | Hit::CategoryCheck(ci) => {
             if let (Some(cat), Some(vi)) = (dlg.categories.get(ci), ci.checked_sub(dlg.cat_scroll)) {
                 let (row, _) = dlg.cat_row_rects(l, vi);
@@ -1306,24 +1428,33 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
             }
         }
         Hit::TreeRowItem(idx) | Hit::TreeRowToggle(idx) | Hit::TreeRowCheck(idx) => {
-            if let (Some(cat), Some(vi), Some(tr)) = (
-                dlg.categories.get(dlg.selected_cat),
-                idx.checked_sub(dlg.app_scroll),
-                dlg.tree_rows.get(idx),
-            ) {
+            if let (Some(vi), Some(tr)) = (idx.checked_sub(dlg.app_scroll), dlg.tree_rows.get(idx)) {
                 match tr {
-                    TreeRow::Folder { sub_idx } => cat.subfolders.get(*sub_idx).map(|g| {
+                    TreeRow::CheckedApp { checked_idx } => dlg.checked_items.get(*checked_idx).map(|item| {
                         let (row, _, _) = dlg.tree_row_rects(l, vi, false);
-                        let tip = if g.default_on {
-                            format!("{} · 点击展开/收起，勾选复选框整目录切换", g.name)
-                        } else {
-                            format!("{} · 工具/系统子目录，按需勾选或展开细选", g.name)
-                        };
-                        (Hit::TreeRowToggle(idx), row, tip)
+                        (
+                            Hit::TreeRowItem(idx),
+                            row,
+                            format!("{} · {} · {}", item.entry.name, item.folder_name, item.entry.target),
+                        )
                     }),
-                    TreeRow::App { sub_idx, entry_idx, indented } => cat
-                        .subfolders
-                        .get(*sub_idx)
+                    TreeRow::Folder { sub_idx } => dlg
+                        .categories
+                        .get(dlg.selected_cat)
+                        .and_then(|cat| cat.subfolders.get(*sub_idx))
+                        .map(|g| {
+                            let (row, _, _) = dlg.tree_row_rects(l, vi, false);
+                            let tip = if g.default_on {
+                                format!("{} · 点击展开/收起，勾选复选框整目录切换", g.name)
+                            } else {
+                                format!("{} · 工具/系统子目录，按需勾选或展开细选", g.name)
+                            };
+                            (Hit::TreeRowToggle(idx), row, tip)
+                        }),
+                    TreeRow::App { sub_idx, entry_idx, indented } => dlg
+                        .categories
+                        .get(dlg.selected_cat)
+                        .and_then(|cat| cat.subfolders.get(*sub_idx))
                         .and_then(|g| g.entries.get(*entry_idx))
                         .map(|e| {
                             let (row, _, _) = dlg.tree_row_rects(l, vi, *indented);
@@ -1802,13 +1933,51 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     draw_button(sf, dc, &l.btn_all_folders, "全部勾选", dlg.font_sub, BtnStyle::Secondary, dlg.hover == Hit::FolderSelectAll, dlg.pressed == Hit::FolderSelectAll, s);
     draw_button(sf, dc, &l.btn_reset_def, "恢复默认", dlg.font_sub, BtnStyle::Secondary, dlg.hover == Hit::FolderResetDefault, dlg.pressed == Hit::FolderResetDefault, s);
 
+    // 切换显示全部已勾选图标的开关行
+    let co_hov = dlg.hover == Hit::ToggleCheckedOnly;
+    let co_prs = dlg.pressed == Hit::ToggleCheckedOnly;
+    if co_prs {
+        sf.fill_rrect(&l.checked_only_row, 7.0 * s, rgb(0xE2E8F0, 1.0));
+    } else if dlg.show_checked_only {
+        sf.fill_rrect(&l.checked_only_row, 7.0 * s, rgb(0xEBF4FF, 1.0));
+    } else if co_hov {
+        sf.fill_rrect(&l.checked_only_row, 7.0 * s, rgb(0xEEF2F6, 1.0));
+    }
+    let co_lbl = RECT {
+        left: l.checked_only_row.left + (8.0 * s) as i32,
+        top: l.checked_only_row.top,
+        right: l.checked_only_toggle.left - (6.0 * s) as i32,
+        bottom: l.checked_only_row.bottom,
+    };
+    draw_text(
+        dc,
+        "只看已勾选",
+        dlg.font_body,
+        &co_lbl,
+        if dlg.show_checked_only { rgb(0x1677FF, 1.0) } else { rgb(0x111827, 1.0) },
+        TextAlign::Left,
+        true,
+        false,
+    );
+    draw_toggle(sf, &l.checked_only_toggle, dlg.show_checked_only, co_hov, co_prs, s);
+    let sep_y = l.checked_only_row.bottom + (4.0 * s).round() as i32;
+    sf.fill_rect(
+        &RECT {
+            left: l.left_pane.left + (10.0 * s) as i32,
+            top: sep_y,
+            right: l.left_pane.right - (10.0 * s) as i32,
+            bottom: sep_y + 1,
+        },
+        rgb(0xE2E8F0, 1.0),
+    );
+
     let q = dlg.search_query().trim().to_lowercase();
     sf.set_clip(Some(l.folder_list_rc));
     for vi in 0..l.folder_vis {
         let ci = dlg.cat_scroll + vi;
         let Some(cat) = dlg.categories.get(ci) else { break };
         let (row, cb) = dlg.cat_row_rects(l, vi);
-        let is_sel = ci == dlg.selected_cat;
+        let is_sel = !dlg.show_checked_only && ci == dlg.selected_cat;
         let is_hov = matches!(dlg.hover, Hit::CategoryRow(i) | Hit::CategoryCheck(i) if i == ci);
         if is_sel {
             sf.fill_rrect(&row, 7.0 * s, rgb(0xEBF4FF, 1.0));
@@ -1892,6 +2061,141 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
             }
             sf.set_clip(None);
             draw_scrollbar(sf, &l.app_scroll_rc, dlg.expired_list.len(), l.exp_vis, dlg.expired_scroll, false, s);
+        }
+        return;
+    }
+
+    if dlg.show_checked_only {
+        let hr = RECT {
+            left: l.right_header.left + (14.0 * s) as i32,
+            top: l.right_header.top,
+            right: l.btn_refresh_checked.left - (10.0 * s) as i32,
+            bottom: l.right_header.bottom,
+        };
+        draw_text(dc, "已勾选图标", dlg.font_section, &hr, rgb(0x111827, 1.0), TextAlign::Left, true, false);
+        draw_button(
+            sf,
+            dc,
+            &l.btn_refresh_checked,
+            "刷新列表",
+            dlg.font_sub,
+            BtnStyle::Secondary,
+            dlg.hover == Hit::RefreshCheckedList,
+            dlg.pressed == Hit::RefreshCheckedList,
+            s,
+        );
+
+        if dlg.tree_rows.is_empty() {
+            let empty_rc = RECT {
+                left: l.app_list_rc.left,
+                top: l.app_list_rc.top + (40.0 * s) as i32,
+                right: l.app_list_rc.right,
+                bottom: l.app_list_rc.bottom,
+            };
+            draw_text(dc, "暂无已勾选的图标", dlg.font_body, &empty_rc, rgb(0x94A3B8, 1.0), TextAlign::Center, false, false);
+        } else {
+            sf.set_clip(Some(l.app_list_rc));
+            for vi in 0..l.app_vis {
+                let idx = dlg.app_scroll + vi;
+                let Some(TreeRow::CheckedApp { checked_idx }) = dlg.tree_rows.get(idx) else {
+                    continue;
+                };
+                let Some(item) = dlg.checked_items.get(*checked_idx) else {
+                    continue;
+                };
+                let (row, _, _) = dlg.tree_row_rects(l, vi, false);
+                let is_hov = matches!(dlg.hover, Hit::TreeRowItem(i) | Hit::AppRemoveManual(i) if i == idx);
+                let is_prs = dlg.pressed == Hit::TreeRowItem(idx);
+                if is_prs {
+                    sf.fill_rrect(&row, 8.0 * s, rgb(0xE2E8F0, 0.8));
+                } else if is_hov {
+                    sf.fill_rrect(&row, 8.0 * s, rgb(0xF1F5F9, 1.0));
+                }
+
+                let mut icon_left = row.left + (10.0 * s) as i32;
+                let is_on = if item.is_manual {
+                    let cb_sz = (16.0 * s).round() as i32;
+                    let cy = (row.top + row.bottom) / 2;
+                    sf.fill_circle(icon_left as f32 + cb_sz as f32 * 0.5, cy as f32, 4.0 * s, rgb(0x1677FF, 0.85));
+                    icon_left += cb_sz + (10.0 * s) as i32;
+                    true
+                } else {
+                    let cb_sz = (16.0 * s).round() as i32;
+                    let cy = (row.top + row.bottom) / 2;
+                    let cbox = RECT {
+                        left: icon_left,
+                        top: cy - cb_sz / 2,
+                        right: icon_left + cb_sz,
+                        bottom: cy + cb_sz / 2,
+                    };
+                    let on = catalog::is_entry_visible(&item.entry, &app.settings);
+                    draw_checkbox(sf, &cbox, if on { CheckState::Checked } else { CheckState::Unchecked }, is_hov, is_prs, s);
+                    icon_left = cbox.right + (10.0 * s) as i32;
+                    on
+                };
+
+                let isz = 22.0 * s;
+                let icx = icon_left as f32 + isz * 0.5;
+                let icy = (row.top + row.bottom) as f32 * 0.5;
+                if let Some(icon) = app.cached_icon(&item.entry.icon_key) {
+                    sf.draw_icon_bilinear(&icon, icx, icy, isz, false, 0.0);
+                } else {
+                    let half = isz * 0.5;
+                    sf.fill_rrect(
+                        &RECT {
+                            left: (icx - half) as i32,
+                            top: (icy - half) as i32,
+                            right: (icx + half) as i32,
+                            bottom: (icy + half) as i32,
+                        },
+                        5.0 * s,
+                        rgb(0xE2E8F0, 1.0),
+                    );
+                }
+
+                let action = dlg.manual_remove_rect(&row);
+                let right_lim = if item.is_manual {
+                    action.left - (6.0 * s) as i32
+                } else {
+                    row.right - (10.0 * s) as i32
+                };
+                let name_rc = RECT {
+                    left: icon_left + isz.round() as i32 + (10.0 * s) as i32,
+                    top: row.top,
+                    right: right_lim,
+                    bottom: row.bottom,
+                };
+                draw_text(
+                    dc,
+                    &item.entry.name,
+                    dlg.font_body,
+                    &name_rc,
+                    if is_on { rgb(0x111827, 1.0) } else { rgb(0x64748B, 1.0) },
+                    TextAlign::Left,
+                    true,
+                    false,
+                );
+
+                if item.is_manual {
+                    let rm_hov = dlg.hover == Hit::AppRemoveManual(idx);
+                    if rm_hov {
+                        sf.fill_circle(
+                            (action.left + action.right) as f32 * 0.5,
+                            (action.top + action.bottom) as f32 * 0.5,
+                            10.0 * s,
+                            rgb(0xFEE2E2, 1.0),
+                        );
+                    }
+                    let ax = (action.left + action.right) as f32 * 0.5;
+                    let ay = (action.top + action.bottom) as f32 * 0.5;
+                    let aa = 3.6 * s;
+                    let ac = if rm_hov { rgb(0xDC2626, 1.0) } else { rgb(0x94A3B8, 1.0) };
+                    sf.thick_line(ax - aa, ay - aa, ax + aa, ay + aa, (1.5 * s).max(1.0), ac);
+                    sf.thick_line(ax - aa, ay + aa, ax + aa, ay - aa, (1.5 * s).max(1.0), ac);
+                }
+            }
+            sf.set_clip(None);
+            draw_scrollbar(sf, &l.app_scroll_rc, dlg.tree_rows.len(), l.app_vis, dlg.app_scroll, false, s);
         }
         return;
     }
@@ -2009,6 +2313,7 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
                             sf.thick_line(ax - aa, ay + aa, ax + aa, ay - aa, (1.5 * s).max(1.0), ac);
                         }
                     }
+                    TreeRow::CheckedApp { .. } => {}
                 }
             }
             sf.set_clip(None);
@@ -2329,6 +2634,7 @@ fn delete_expired_indices(dlg: &mut Dlg, app: &mut App, indices: Vec<usize>) {
         app.settings.manual.retain(|m| !removed_ids.contains(&m.id));
         for id in &removed_ids {
             app.settings.app_overrides.remove(id);
+            app.settings.remove_app_from_folders(id);
         }
         app.scan.entries.retain(|e| !removed_ids.contains(&e.id));
         let cache = crate::config::CatalogCache {
@@ -2730,14 +3036,41 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                                 }
                             }
                             dlg.commit_filter_settings(app);
+                            if dlg.show_checked_only {
+                                dlg.rebuild_checked_items(app);
+                                dlg.rebuild_tree();
+                                dlg.request_visible_app_icons(app, &l);
+                            }
                         }
                         Hit::FolderResetDefault => {
                             app.settings.folder_overrides.clear();
                             app.settings.app_overrides.clear();
                             dlg.commit_filter_settings(app);
+                            if dlg.show_checked_only {
+                                dlg.rebuild_checked_items(app);
+                                dlg.rebuild_tree();
+                                dlg.request_visible_app_icons(app, &l);
+                            }
+                        }
+                        Hit::ToggleCheckedOnly => {
+                            dlg.show_expired = false;
+                            dlg.show_checked_only = !dlg.show_checked_only;
+                            dlg.app_scroll = 0;
+                            if dlg.show_checked_only {
+                                dlg.rebuild_checked_items(app);
+                            }
+                            dlg.rebuild_tree();
+                            dlg.request_visible_app_icons(app, &l);
+                        }
+                        Hit::RefreshCheckedList => {
+                            dlg.app_scroll = 0;
+                            dlg.rebuild_checked_items(app);
+                            dlg.rebuild_tree();
+                            dlg.request_visible_app_icons(app, &l);
                         }
                         Hit::CategoryRow(ci) => {
                             dlg.show_expired = false;
+                            dlg.show_checked_only = false;
                             dlg.selected_cat = ci;
                             dlg.app_scroll = 0;
                             dlg.rebuild_tree();
@@ -2745,6 +3078,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         }
                         Hit::CategoryCheck(ci) => {
                             dlg.show_expired = false;
+                            dlg.show_checked_only = false;
                             dlg.toggle_category(app, ci);
                             dlg.selected_cat = ci;
                             dlg.app_scroll = 0;
@@ -2788,23 +3122,45 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             }
                         }
                         Hit::TreeRowItem(idx) => {
-                            if let Some(TreeRow::App { sub_idx, entry_idx, .. }) = dlg.tree_rows.get(idx).cloned() {
-                                dlg.toggle_entry(app, sub_idx, entry_idx);
+                            match dlg.tree_rows.get(idx).cloned() {
+                                Some(TreeRow::App { sub_idx, entry_idx, .. }) => {
+                                    dlg.toggle_entry(app, sub_idx, entry_idx);
+                                }
+                                Some(TreeRow::CheckedApp { checked_idx }) => {
+                                    if let Some(item) = dlg.checked_items.get(checked_idx).cloned() {
+                                        if !item.is_manual {
+                                            let cur = catalog::is_entry_visible(&item.entry, &app.settings);
+                                            app.settings.app_overrides.insert(item.entry.id, !cur);
+                                            dlg.commit_filter_settings(app);
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         Hit::AppRemoveManual(idx) => {
-                            if let (Some(cat), Some(TreeRow::App { sub_idx, entry_idx, .. })) =
-                                (dlg.categories.get(dlg.selected_cat), dlg.tree_rows.get(idx).cloned())
-                            {
-                                if let Some(e) = cat.subfolders.get(sub_idx).and_then(|g| g.entries.get(entry_idx)) {
-                                    let id = e.id.clone();
-                                    app.settings.manual.retain(|m| m.id != id);
-                                    app.store.save_settings(&app.settings);
-                                    app.rebuild_view();
-                                    dlg.rebuild_groups(app);
-                                    let max_s = dlg.tree_rows.len().saturating_sub(l.app_vis);
-                                    dlg.app_scroll = dlg.app_scroll.min(max_s);
-                                }
+                            let remove_id = match dlg.tree_rows.get(idx).cloned() {
+                                Some(TreeRow::App { sub_idx, entry_idx, .. }) => dlg
+                                    .categories
+                                    .get(dlg.selected_cat)
+                                    .and_then(|cat| cat.subfolders.get(sub_idx))
+                                    .and_then(|g| g.entries.get(entry_idx))
+                                    .map(|e| e.id.clone()),
+                                Some(TreeRow::CheckedApp { checked_idx }) => dlg
+                                    .checked_items
+                                    .get(checked_idx)
+                                    .filter(|item| item.is_manual)
+                                    .map(|item| item.entry.id.clone()),
+                                _ => None,
+                            };
+                            if let Some(id) = remove_id {
+                                app.settings.manual.retain(|m| m.id != id);
+                                app.settings.remove_app_from_folders(&id);
+                                app.store.save_settings(&app.settings);
+                                app.rebuild_view();
+                                dlg.rebuild_groups(app);
+                                let max_s = dlg.tree_rows.len().saturating_sub(l.app_vis);
+                                dlg.app_scroll = dlg.app_scroll.min(max_s);
                             }
                         }
                         Hit::AddManualBtn => {
@@ -3041,9 +3397,59 @@ mod tests {
         }
         let (rw, _) = measure_text(dc, "重建图标缓存", font);
         assert!(rw > 0 && rw + 14 <= 104, "重建图标缓存按钮过宽 ({rw}px)");
+        let (cw, _) = measure_text(dc, "只看已勾选", font);
+        assert!(cw > 0 && cw + 8 <= 146, "只看已勾选标签过宽 ({cw}px)");
+        let (rfw, _) = measure_text(dc, "刷新列表", font);
+        assert!(rfw > 0 && rfw + 12 <= 76, "刷新列表按钮过宽 ({rfw}px)");
         unsafe {
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
         target.release();
+    }
+
+    #[test]
+    fn collect_checked_items_includes_all_visible_apps_sorted() {
+        use crate::catalog::{AppEntry, Source};
+        use crate::config::Settings;
+
+        let mk = |id: &str, name: &str, fid: &str, fname: &str| AppEntry {
+            id: id.into(),
+            name: name.into(),
+            source: Source::UserMenu,
+            target: format!(r"C:\Apps\{name}.exe"),
+            args: String::new(),
+            aliases: Vec::new(),
+            icon_key: String::new(),
+            folder_id: fid.into(),
+            folder_name: fname.into(),
+        };
+        let scan = vec![
+            mk("a1", "微信", "menu:wechat", "微信"),
+            mk("a2", "Chrome", "start_root", "开始菜单根目录"),
+            mk("a3", "Windows 工具", "apps_system", "Windows 系统与管理工具"),
+            mk("a4", "钉钉", "menu:dingtalk", "钉钉"),
+        ];
+        let mut settings = Settings::default();
+        // 默认 apps_system 关闭，手动关闭 a4，额外添加一个手动应用
+        settings.app_overrides.insert("a4".into(), false);
+        settings.manual.push(AppEntry {
+            id: "manual:custom".into(),
+            name: "百度网盘".into(),
+            source: Source::Manual,
+            target: r"C:\Apps\baidunetdisk.exe".into(),
+            args: String::new(),
+            aliases: Vec::new(),
+            icon_key: String::new(),
+            folder_id: "manual".into(),
+            folder_name: "手动添加".into(),
+        });
+
+        let items = collect_checked_items(&scan, &settings);
+        let names: Vec<&str> = items.iter().map(|i| i.entry.name.as_str()).collect();
+        // 百度网盘(bai) < Chrome(chrome) < 微信(wei)；a3(默认隐藏)与a4(手动取消)不出现
+        assert_eq!(names, ["百度网盘", "Chrome", "微信"]);
+        assert!(items[0].is_manual);
+        assert!(!items[1].is_manual);
+        assert!(!items[2].is_manual);
     }
 }

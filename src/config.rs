@@ -1,8 +1,10 @@
 ﻿//! 用户设置与应用目录缓存的持久化（%LOCALAPPDATA%\WinLaunchpad）。
 //! 写入方式：先写 .tmp 再 rename 覆盖，设置文件额外保留一份 .bak。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::catalog::AppEntry;
 use crate::hotkey::HotkeySpec;
@@ -109,6 +111,20 @@ pub fn roundness_ratio(mode: u8) -> f32 {
         .unwrap_or(0.225)
 }
 
+/// 用户在启动台中创建的自定义文件夹。
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchpadFolder {
+    /// 文件夹稳定唯一标识
+    pub id: String,
+    /// 文件夹显示名称
+    pub name: String,
+    /// 归属到该文件夹内的应用 ID（对应 `AppEntry::id`）
+    #[serde(default)]
+    pub app_ids: Vec<String>,
+}
+
+static NEXT_FOLDER_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -153,6 +169,9 @@ pub struct Settings {
     /// 用户手动添加的条目
     #[serde(default)]
     pub manual: Vec<AppEntry>,
+    /// 用户在启动台中创建的文件夹列表
+    #[serde(default)]
+    pub folders: Vec<LaunchpadFolder>,
     /// 后台定时扫描刷新间隔（秒，0 表示关闭定时扫描，默认 30）
     #[serde(default = "default_scan_interval_secs")]
     pub scan_interval_secs: u32,
@@ -188,12 +207,109 @@ impl Default for Settings {
             app_overrides: HashMap::new(),
             hidden: Vec::new(),
             manual: Vec::new(),
+            folders: Vec::new(),
             scan_interval_secs: default_scan_interval_secs(),
             event_watch_enabled: true,
             scan_on_show: false,
             refresh_changed_icons: true,
             auto_check_update: true,
         }
+    }
+}
+
+impl Settings {
+    /// 创建一个新的启动台文件夹并返回其唯一标识；名称为空白时返回 `None`。
+    pub fn create_folder(&mut self, name: &str) -> Option<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let seq = NEXT_FOLDER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let id = format!("fld:{ts:x}_{seq}");
+        self.folders.push(LaunchpadFolder {
+            id: id.clone(),
+            name: trimmed.to_string(),
+            app_ids: Vec::new(),
+        });
+        Some(id)
+    }
+
+    /// 重命名指定文件夹；名称空白或未找到文件夹或名称未变更时返回 `false`。
+    pub fn rename_folder(&mut self, folder_id: &str, name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) else {
+            return false;
+        };
+        if folder.name == trimmed {
+            return false;
+        }
+        folder.name = trimmed.to_string();
+        true
+    }
+
+    /// 删除指定文件夹，其内部应用 ID 随之恢复到启动台主网格展示。
+    pub fn delete_folder(&mut self, folder_id: &str) -> bool {
+        let before = self.folders.len();
+        self.folders.retain(|f| f.id != folder_id);
+        self.folders.len() != before
+    }
+
+    /// 将指定应用移动至目标文件夹（先从其他文件夹移除，保证单应用最多归属一个文件夹）。
+    pub fn move_app_to_folder(&mut self, app_id: &str, folder_id: &str) -> bool {
+        if !self.folders.iter().any(|f| f.id == folder_id) {
+            return false;
+        }
+        let mut changed = false;
+        for f in &mut self.folders {
+            if f.id == folder_id {
+                if !f.app_ids.iter().any(|id| id == app_id) {
+                    f.app_ids.push(app_id.to_string());
+                    changed = true;
+                }
+            } else {
+                let prev = f.app_ids.len();
+                f.app_ids.retain(|id| id != app_id);
+                if f.app_ids.len() != prev {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// 将指定应用从所有文件夹中移除（恢复到启动台主网格）。
+    pub fn remove_app_from_folders(&mut self, app_id: &str) -> bool {
+        let mut changed = false;
+        for f in &mut self.folders {
+            let prev = f.app_ids.len();
+            f.app_ids.retain(|id| id != app_id);
+            if f.app_ids.len() != prev {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 清理文件夹列表中的空名称、重复文件夹 ID 及跨文件夹重复应用 ID。
+    pub fn sanitize_folders(&mut self) {
+        let mut seen_folders = HashSet::new();
+        let mut seen_apps = HashSet::new();
+        self.folders.retain_mut(|f| {
+            let name = f.name.trim().to_string();
+            if f.id.is_empty() || name.is_empty() || !seen_folders.insert(f.id.clone()) {
+                return false;
+            }
+            f.name = name;
+            f.app_ids.retain(|aid| !aid.is_empty() && seen_apps.insert(aid.clone()));
+            true
+        });
     }
 }
 
@@ -268,6 +384,7 @@ impl Store {
         s.grid_rows = if s.grid_rows <= 0 { 0 } else { s.grid_rows.clamp(3, 8) };
         s.scan_interval_secs = snap_scan_interval_secs(s.scan_interval_secs);
         s.gesture_threshold = clamp_gesture_threshold(s.gesture_threshold);
+        s.sanitize_folders();
         s
     }
 
@@ -373,5 +490,34 @@ mod tests {
         assert_eq!(clamp_gesture_threshold(70), 70);
         assert_eq!(clamp_gesture_threshold(85), 85);
         assert_eq!(clamp_gesture_threshold(100), 95);
+    }
+
+    #[test]
+    fn folder_crud_and_uniqueness_work() {
+        let mut s = Settings::default();
+        assert!(s.create_folder("   ").is_none());
+        let f1 = s.create_folder(" 办公 ").unwrap();
+        let f2 = s.create_folder("游戏").unwrap();
+        assert_ne!(f1, f2);
+        assert_eq!(s.folders[0].name, "办公");
+
+        assert!(s.move_app_to_folder("app1", &f1));
+        assert!(!s.move_app_to_folder("app1", &f1));
+        assert_eq!(s.folders[0].app_ids, vec!["app1"]);
+
+        // 移动到新文件夹时应自动从旧文件夹迁出
+        assert!(s.move_app_to_folder("app1", &f2));
+        assert!(s.folders[0].app_ids.is_empty());
+        assert_eq!(s.folders[1].app_ids, vec!["app1"]);
+
+        assert!(s.rename_folder(&f2, "娱乐工具"));
+        assert_eq!(s.folders[1].name, "娱乐工具");
+        assert!(!s.rename_folder(&f2, "   "));
+
+        assert!(s.remove_app_from_folders("app1"));
+        assert!(s.folders[1].app_ids.is_empty());
+
+        assert!(s.delete_folder(&f1));
+        assert_eq!(s.folders.len(), 1);
     }
 }

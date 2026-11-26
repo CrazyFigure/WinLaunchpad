@@ -31,8 +31,10 @@ use crate::icons::{IconResult, IconWorker, WM_APP_ICON};
 use crate::launch;
 use crate::log;
 use crate::render::{
-    adaptive_grid, cell_visual_rect, compute_layout, dot_rect, hit_test, ContextCmd, ContextItem,
-    ContextMenu, Frame, Hit, Layout, Renderer, ViewItem, C_TEXT_HINT,
+    adaptive_grid, cell_visual_rect, compute_folder_layout, compute_layout, dot_rect,
+    folder_dot_rect, folder_hit_test, hit_test, ContextCmd, ContextItem, ContextMenu, DragGhost,
+    FolderHit, FolderLayout, Frame, Hit, Layout, OpenFolderFrame, Renderer, ViewItem, ViewItemKind,
+    C_TEXT_HINT,
 };
 use crate::startup;
 use crate::tray::{self, Tray};
@@ -65,6 +67,7 @@ const TIMER_SLIDE: usize = 2;
 const TIMER_TOOLTIP: usize = 3;
 const TIMER_AUTO_SCAN: usize = 4;
 const TIMER_AUTO_UPDATE: usize = 5;
+const TIMER_DRAG_EDGE: usize = 6;
 const SHOW_SCAN_THROTTLE_SECS: u64 = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FADE_DURATION_MS: f32 = 135.0;
@@ -166,14 +169,119 @@ fn entry_meta_eq(a: &AppEntry, b: &AppEntry) -> bool {
 #[derive(Clone, PartialEq, Eq)]
 enum TipTarget {
     Cell(usize),
+    NewFolder,
     Add,
     Settings,
     Dot(usize),
+    FolderTitle,
+    FolderClose,
+    FolderCell(usize),
+    FolderDot(usize),
 }
 
+#[derive(Clone, Debug)]
 pub struct VisibleItem {
     pub entry: AppEntry,
     pub valid: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum GridEntry {
+    App(VisibleItem),
+    Folder {
+        id: String,
+        name: String,
+        apps: Vec<VisibleItem>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FilteredRef {
+    View(usize),
+    AllApp(usize),
+}
+
+enum GridEntryRef<'a> {
+    App(&'a VisibleItem),
+    Folder {
+        id: &'a str,
+        name: &'a str,
+        apps: &'a [VisibleItem],
+    },
+}
+
+#[derive(Clone, Debug)]
+struct IconDrag {
+    app_id: String,
+    icon_key: String,
+    name: String,
+    from_folder: Option<String>,
+    start_x: i32,
+    start_y: i32,
+    cur_x: i32,
+    cur_y: i32,
+    moved: bool,
+    target_folder_id: Option<String>,
+    outside_folder: bool,
+    edge_dir: i32,
+    edge_since: Option<Instant>,
+}
+
+fn inside_rect(r: &RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// 根据扫描目录与用户配置构建启动台主视图（独立应用按中英文拼音字母排序在前，文件夹按字母排序在后，文件夹内同样按字母排序）。
+pub fn build_grid_view(scan_entries: &[AppEntry], settings: &Settings) -> (Vec<GridEntry>, Vec<VisibleItem>) {
+    let mut all_apps: Vec<VisibleItem> =
+        Vec::with_capacity(scan_entries.len() + settings.manual.len());
+    for e in scan_entries.iter().chain(settings.manual.iter()) {
+        if !catalog::is_entry_visible(e, settings) {
+            continue;
+        }
+        let valid = catalog::is_entry_target_valid(e);
+        all_apps.push(VisibleItem {
+            entry: e.clone(),
+            valid,
+        });
+    }
+    all_apps.sort_by(|a, b| catalog::cmp_names(&a.entry.name, &b.entry.name));
+
+    let mut app_to_folder: HashMap<&str, &str> = HashMap::new();
+    for f in &settings.folders {
+        for aid in &f.app_ids {
+            app_to_folder.entry(aid.as_str()).or_insert(f.id.as_str());
+        }
+    }
+
+    let mut standalone: Vec<VisibleItem> = Vec::new();
+    let mut by_folder: HashMap<&str, Vec<VisibleItem>> = HashMap::new();
+    for item in &all_apps {
+        if let Some(&fid) = app_to_folder.get(item.entry.id.as_str()) {
+            by_folder.entry(fid).or_default().push(item.clone());
+        } else {
+            standalone.push(item.clone());
+        }
+    }
+
+    let mut folders: Vec<(String, String, Vec<VisibleItem>)> = settings
+        .folders
+        .iter()
+        .map(|f| {
+            let apps = by_folder.remove(f.id.as_str()).unwrap_or_default();
+            (f.id.clone(), f.name.clone(), apps)
+        })
+        .collect();
+    folders.sort_by(|a, b| catalog::cmp_names(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut view: Vec<GridEntry> = Vec::with_capacity(standalone.len() + folders.len());
+    for app in standalone {
+        view.push(GridEntry::App(app));
+    }
+    for (id, name, apps) in folders {
+        view.push(GridEntry::Folder { id, name, apps });
+    }
+    (view, all_apps)
 }
 
 /// 全局手势实时轨迹与动作提示透明分层浮窗（类似 Quicker：亮青顺滑轨迹 + 光标旁悬空文字，零点击拦截）。
@@ -478,8 +586,9 @@ pub struct App {
     pub scan: ScanResult,
     pub scanning: bool,
     pub wp_loading: bool,
-    pub view: Vec<VisibleItem>,
-    pub filtered: Vec<usize>,
+    pub view: Vec<GridEntry>,
+    pub all_apps: Vec<VisibleItem>,
+    pub filtered: Vec<FilteredRef>,
     pub page: usize,
     pub selected: Option<usize>,
     pub hover: Option<usize>,
@@ -499,7 +608,8 @@ pub struct App {
     pub modal: u32,
     pub in_menu: bool,
     pub context_menu: Option<ContextMenu>,
-    pub menu_target: Option<usize>,
+    menu_app_target: Option<VisibleItem>,
+    menu_folder_target: Option<String>,
     pub taskbar_created_msg: u32,
     pub gesture: Option<gesture::GestureHandle>,
     gesture_overlay: GestureOverlay,
@@ -511,7 +621,15 @@ pub struct App {
     last_show_scan_at: Option<Instant>,
     pub settings_hwnd: HWND,
     pub add_hwnd: HWND,
+    pub folder_hwnd: HWND,
     pub update_hwnd: HWND,
+    // 文件夹展开态与拖拽图标状态
+    open_folder_id: Option<String>,
+    folder_page: usize,
+    folder_hover: Option<FolderHit>,
+    pressed_folder: Option<FolderHit>,
+    folder_selected: Option<usize>,
+    icon_drag: Option<IconDrag>,
     pub available_update: Option<crate::update::UpdateBundle>,
     auto_updating: bool,
     auto_notified_version: Option<String>,
@@ -578,6 +696,7 @@ impl App {
             scanning: false,
             wp_loading: false,
             view: Vec::new(),
+            all_apps: Vec::new(),
             filtered: Vec::new(),
             page: 0,
             selected: None,
@@ -598,7 +717,8 @@ impl App {
             modal: 0,
             in_menu: false,
             context_menu: None,
-            menu_target: None,
+            menu_app_target: None,
+            menu_folder_target: None,
             taskbar_created_msg,
             gesture: None,
             gesture_overlay: GestureOverlay::new(),
@@ -610,7 +730,14 @@ impl App {
             last_show_scan_at: None,
             settings_hwnd: HWND::default(),
             add_hwnd: HWND::default(),
+            folder_hwnd: HWND::default(),
             update_hwnd: HWND::default(),
+            open_folder_id: None,
+            folder_page: 0,
+            folder_hover: None,
+            pressed_folder: None,
+            folder_selected: None,
+            icon_drag: None,
             available_update: None,
             auto_updating: false,
             auto_notified_version: None,
@@ -671,39 +798,45 @@ impl App {
     // ---------- 目录与视图 ----------
 
     pub fn rebuild_view(&mut self) {
-        let mut view: Vec<VisibleItem> =
-            Vec::with_capacity(self.scan.entries.len() + self.settings.manual.len());
-        for e in self.scan.entries.iter().chain(self.settings.manual.iter()) {
-            if !catalog::is_entry_visible(e, &self.settings) {
-                continue;
-            }
-            let valid = catalog::is_entry_target_valid(e);
-            view.push(VisibleItem {
-                entry: e.clone(),
-                valid,
-            });
-        }
-        view.sort_by(|a, b| catalog::cmp_names(&a.entry.name, &b.entry.name));
+        let (view, all_apps) = build_grid_view(&self.scan.entries, &self.settings);
         self.view = view;
+        self.all_apps = all_apps;
+        if let Some(fid) = &self.open_folder_id {
+            if !self.settings.folders.iter().any(|f| &f.id == fid) {
+                self.open_folder_id = None;
+                self.folder_page = 0;
+                self.folder_selected = None;
+            }
+        }
         // 添加/删除条目或更新设置后保持当前页码，仅在超出总页数时向前收窄
         self.rebuild_filtered(false);
+        self.clamp_folder_page();
     }
 
     fn rebuild_filtered(&mut self, reset_page: bool) {
         let q = self.query().to_lowercase();
         let q = q.trim();
         self.filtered = if q.is_empty() {
-            (0..self.view.len()).collect()
+            (0..self.view.len()).map(FilteredRef::View).collect()
         } else {
-            self.view
+            let mut out: Vec<FilteredRef> = self
+                .all_apps
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| {
                     v.entry.name.to_lowercase().contains(q)
                         || v.entry.aliases.iter().any(|a| a.contains(q))
                 })
-                .map(|(i, _)| i)
-                .collect()
+                .map(|(i, _)| FilteredRef::AllApp(i))
+                .collect();
+            for (i, ge) in self.view.iter().enumerate() {
+                if let GridEntry::Folder { name, .. } = ge {
+                    if name.to_lowercase().contains(q) {
+                        out.push(FilteredRef::View(i));
+                    }
+                }
+            }
+            out
         };
         if reset_page {
             self.page = 0;
@@ -718,6 +851,90 @@ impl App {
         self.clamp_page();
         self.position_edit();
         self.request_page_icons();
+    }
+
+    fn entry_at_filtered(&self, pos: usize) -> Option<GridEntryRef<'_>> {
+        match *self.filtered.get(pos)? {
+            FilteredRef::View(vi) => match self.view.get(vi)? {
+                GridEntry::App(v) => Some(GridEntryRef::App(v)),
+                GridEntry::Folder { id, name, apps } => Some(GridEntryRef::Folder {
+                    id: id.as_str(),
+                    name: name.as_str(),
+                    apps: apps.as_slice(),
+                }),
+            },
+            FilteredRef::AllApp(ai) => self.all_apps.get(ai).map(GridEntryRef::App),
+        }
+    }
+
+    fn filtered_id_at(&self, pos: usize) -> Option<&str> {
+        match self.entry_at_filtered(pos)? {
+            GridEntryRef::App(v) => Some(v.entry.id.as_str()),
+            GridEntryRef::Folder { id, .. } => Some(id),
+        }
+    }
+
+    fn open_folder_ref(&self) -> Option<(&str, &str, &[VisibleItem])> {
+        let fid = self.open_folder_id.as_deref()?;
+        for ge in &self.view {
+            if let GridEntry::Folder { id, name, apps } = ge {
+                if id == fid {
+                    return Some((id.as_str(), name.as_str(), apps.as_slice()));
+                }
+            }
+        }
+        None
+    }
+
+    fn open_folder_layout(&self) -> Option<(FolderLayout, usize)> {
+        let (_, _, apps) = self.open_folder_ref()?;
+        let base_fl = compute_folder_layout(
+            self.layout.w.max(1),
+            self.layout.h.max(1),
+            self.scale,
+            self.settings.icon_size_dp,
+            2,
+        );
+        let per = base_fl.cells.len().max(1);
+        let pages = apps.len().div_ceil(per).max(1);
+        let fl = compute_folder_layout(
+            self.layout.w.max(1),
+            self.layout.h.max(1),
+            self.scale,
+            self.settings.icon_size_dp,
+            pages,
+        );
+        Some((fl, pages))
+    }
+
+    fn clamp_folder_page(&mut self) {
+        if let Some((_, pages)) = self.open_folder_layout() {
+            if self.folder_page >= pages {
+                self.folder_page = pages - 1;
+            }
+        } else {
+            self.folder_page = 0;
+        }
+    }
+
+    fn open_folder_page_items(&self, per: usize, page: usize) -> Vec<ViewItem> {
+        let Some((_, _, apps)) = self.open_folder_ref() else {
+            return Vec::new();
+        };
+        let start = page * per;
+        if start >= apps.len() {
+            return Vec::new();
+        }
+        apps[start..apps.len().min(start + per)]
+            .iter()
+            .map(|v| ViewItem {
+                id: v.entry.id.clone(),
+                key: v.entry.icon_key.clone(),
+                name: v.entry.name.clone(),
+                valid: v.valid,
+                kind: ViewItemKind::App,
+            })
+            .collect()
     }
 
     pub fn query(&self) -> String {
@@ -748,12 +965,24 @@ impl App {
         if start >= self.filtered.len() {
             return Vec::new();
         }
-        self.filtered[start..self.filtered.len().min(start + per)]
-            .iter()
-            .map(|&i| ViewItem {
-                key: self.view[i].entry.icon_key.clone(),
-                name: self.view[i].entry.name.clone(),
-                valid: self.view[i].valid,
+        (start..self.filtered.len().min(start + per))
+            .filter_map(|pos| match self.entry_at_filtered(pos)? {
+                GridEntryRef::App(v) => Some(ViewItem {
+                    id: v.entry.id.clone(),
+                    key: v.entry.icon_key.clone(),
+                    name: v.entry.name.clone(),
+                    valid: v.valid,
+                    kind: ViewItemKind::App,
+                }),
+                GridEntryRef::Folder { id, name, apps } => Some(ViewItem {
+                    id: id.to_string(),
+                    key: String::new(),
+                    name: name.to_string(),
+                    valid: true,
+                    kind: ViewItemKind::Folder {
+                        preview_keys: apps.iter().take(9).map(|a| a.entry.icon_key.clone()).collect(),
+                    },
+                }),
             })
             .collect()
     }
@@ -775,11 +1004,42 @@ impl App {
         }
     }
 
+    fn request_icons_for_items(&mut self, items: &[ViewItem], size: u32) {
+        for item in items {
+            match &item.kind {
+                ViewItemKind::App => self.ensure_icon_loaded(&item.key, size),
+                ViewItemKind::Folder { preview_keys } => {
+                    for k in preview_keys {
+                        self.ensure_icon_loaded(k, size);
+                    }
+                }
+            }
+        }
+    }
+
     /// 优先加载当前可视页图标，确保启动台首帧零阻塞立即呈现。
     pub fn request_current_page_icons(&mut self) {
         let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
-        for item in self.page_items() {
-            self.ensure_icon_loaded(&item.key, size);
+        let items = self.page_items();
+        self.request_icons_for_items(&items, size);
+        self.request_open_folder_icons();
+    }
+
+    fn request_open_folder_icons(&mut self) {
+        let Some((fl, pages)) = self.open_folder_layout() else {
+            return;
+        };
+        let size = (fl.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
+        let per = fl.cells.len().max(1);
+        let cur = self.open_folder_page_items(per, self.folder_page);
+        self.request_icons_for_items(&cur, size);
+        if self.folder_page + 1 < pages {
+            let next = self.open_folder_page_items(per, self.folder_page + 1);
+            self.request_icons_for_items(&next, size);
+        }
+        if self.folder_page > 0 {
+            let prev = self.open_folder_page_items(per, self.folder_page - 1);
+            self.request_icons_for_items(&prev, size);
         }
     }
 
@@ -787,14 +1047,12 @@ impl App {
     pub fn prefetch_neighbor_icons(&mut self) {
         let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
         if self.page + 1 < self.pages() {
-            for item in self.items_for_page(self.page + 1) {
-                self.ensure_icon_loaded(&item.key, size);
-            }
+            let items = self.items_for_page(self.page + 1);
+            self.request_icons_for_items(&items, size);
         }
         if self.page > 0 {
-            for item in self.items_for_page(self.page - 1) {
-                self.ensure_icon_loaded(&item.key, size);
-            }
+            let items = self.items_for_page(self.page - 1);
+            self.request_icons_for_items(&items, size);
         }
     }
 
@@ -1166,8 +1424,8 @@ impl App {
         let kind = self.active_scan_kind;
         let prev_sel = self
             .selected
-            .and_then(|i| self.filtered.get(i))
-            .map(|&vi| self.view[vi].entry.id.clone());
+            .and_then(|pos| self.filtered_id_at(pos))
+            .map(str::to_string);
         self.scanning = false;
         let usable = !r.entries.is_empty() || self.scan.entries.is_empty();
         if usable {
@@ -1272,14 +1530,14 @@ impl App {
         }
 
         let validity_changed = self
-            .view
+            .all_apps
             .iter()
             .any(|v| catalog::is_entry_target_valid(&v.entry) != v.valid);
 
         if entries_changed || validity_changed || icons_invalidated {
             self.rebuild_view();
             if let Some(id) = prev_sel {
-                if let Some(pos) = self.filtered.iter().position(|&vi| self.view[vi].entry.id == id) {
+                if let Some(pos) = (0..self.filtered.len()).position(|p| self.filtered_id_at(p) == Some(id.as_str())) {
                     self.selected = Some(pos);
                     self.page = pos / self.per_page();
                 }
@@ -1319,8 +1577,24 @@ impl App {
     fn on_icon(&mut self, r: IconResult) {
         let Some(px) = r.pixels else { return };
         self.renderer.add_icon(&r.key, &px, r.w, r.h);
-        if self.visible && self.page_items().iter().any(|i| i.key == r.key) {
-            self.invalidate_grid();
+        if self.visible {
+            let hit_main = self.page_items().iter().any(|i| {
+                i.key == r.key
+                    || matches!(&i.kind, ViewItemKind::Folder { preview_keys } if preview_keys.iter().any(|k| k == &r.key))
+            });
+            let hit_folder = if let Some((fl, _)) = self.open_folder_layout() {
+                let per = fl.cells.len().max(1);
+                self.open_folder_page_items(per, self.folder_page)
+                    .iter()
+                    .any(|i| i.key == r.key)
+            } else {
+                false
+            };
+            if hit_folder {
+                self.invalidate();
+            } else if hit_main {
+                self.invalidate_grid();
+            }
         }
         unsafe {
             if !self.settings_hwnd.is_invalid() && IsWindow(self.settings_hwnd).as_bool() {
@@ -1423,6 +1697,14 @@ impl App {
             self.slide_anim = false;
             self.slide_neighbor = None;
             self.context_menu = None;
+            self.menu_app_target = None;
+            self.menu_folder_target = None;
+            self.open_folder_id = None;
+            self.folder_page = 0;
+            self.folder_hover = None;
+            self.pressed_folder = None;
+            self.folder_selected = None;
+            self.icon_drag = None;
             self.tip_pending = None;
             self.tip_visible = None;
             self.selected = None;
@@ -1537,9 +1819,11 @@ impl App {
             let _ = KillTimer(self.hwnd, TIMER_FADE);
             let _ = KillTimer(self.hwnd, TIMER_SLIDE);
             let _ = KillTimer(self.hwnd, TIMER_TOOLTIP);
-            if self.drag_active {
+            let _ = KillTimer(self.hwnd, TIMER_DRAG_EDGE);
+            if self.drag_active || self.icon_drag.is_some() {
                 self.drag_active = false;
                 self.drag_moved = false;
+                self.icon_drag = None;
                 let _ = ReleaseCapture();
             }
             self.fading = false;
@@ -1547,6 +1831,13 @@ impl App {
             self.visible = false;
             self.alpha = 255;
             self.context_menu = None;
+            self.menu_app_target = None;
+            self.menu_folder_target = None;
+            self.open_folder_id = None;
+            self.folder_page = 0;
+            self.folder_hover = None;
+            self.pressed_folder = None;
+            self.folder_selected = None;
             self.tip_pending = None;
             self.tip_visible = None;
             self.slide_x = 0.0;
@@ -1632,14 +1923,18 @@ impl App {
 
     // ---------- 交互操作 ----------
 
-    fn page_index_to_view(&self, i: usize) -> Option<usize> {
-        self.filtered.get(self.page * self.per_page() + i).copied()
+    fn page_cell_to_filtered(&self, i: usize) -> Option<usize> {
+        let pos = self.page * self.per_page() + i;
+        if pos < self.filtered.len() {
+            Some(pos)
+        } else {
+            None
+        }
     }
 
-    fn launch_view_index(&mut self, vi: usize) {
-        let Some(v) = self.view.get(vi) else { return };
-        let entry = v.entry.clone();
-        let valid = v.valid;
+    fn launch_visible_item(&mut self, item: &VisibleItem) {
+        let entry = item.entry.clone();
+        let valid = item.valid;
         if !valid {
             let name = entry.name.clone();
             self.hide();
@@ -1666,11 +1961,51 @@ impl App {
         });
     }
 
+    fn open_folder(&mut self, folder_id: String) {
+        self.open_folder_id = Some(folder_id);
+        self.folder_page = 0;
+        self.folder_hover = None;
+        self.pressed_folder = None;
+        self.folder_selected = None;
+        self.cancel_tooltip();
+        self.request_open_folder_icons();
+        self.invalidate();
+    }
+
+    fn close_open_folder(&mut self) {
+        if self.open_folder_id.is_some() {
+            self.open_folder_id = None;
+            self.folder_page = 0;
+            self.folder_hover = None;
+            self.pressed_folder = None;
+            self.folder_selected = None;
+            self.cancel_tooltip();
+            self.invalidate();
+        }
+    }
+
     fn launch_selected(&mut self) {
+        if let Some((_, _, apps)) = self.open_folder_ref() {
+            let idx = self
+                .folder_selected
+                .or(if apps.is_empty() { None } else { Some(0) });
+            if let Some(item) = idx.and_then(|i| apps.get(i).cloned()) {
+                self.launch_visible_item(&item);
+            }
+            return;
+        }
         let idx = self.selected.or(if self.filtered.is_empty() { None } else { Some(0) });
-        if let Some(i) = idx {
-            if let Some(vi) = self.filtered.get(i).copied() {
-                self.launch_view_index(vi);
+        if let Some(pos) = idx {
+            match self.entry_at_filtered(pos) {
+                Some(GridEntryRef::App(v)) => {
+                    let item = v.clone();
+                    self.launch_visible_item(&item);
+                }
+                Some(GridEntryRef::Folder { id, .. }) => {
+                    let fid = id.to_string();
+                    self.open_folder(fid);
+                }
+                None => {}
             }
         }
     }
@@ -1688,15 +2023,14 @@ impl App {
         }
     }
 
-    fn remove_view_index(&mut self, vi: usize) {
-        let Some(v) = self.view.get(vi) else { return };
-        let id = v.entry.id.clone();
-        let source = v.entry.source;
-        if source == Source::Manual {
+    fn remove_app_entry(&mut self, entry: &AppEntry) {
+        let id = entry.id.clone();
+        if entry.source == Source::Manual {
             self.settings.manual.retain(|m| m.id != id);
         } else {
-            self.settings.app_overrides.insert(id, false);
+            self.settings.app_overrides.insert(id.clone(), false);
         }
+        self.settings.remove_app_from_folders(&id);
         if !self.store.save_settings(&self.settings) {
             self.show_error("保存设置失败，本次移除在重启后可能失效。");
         }
@@ -1704,14 +2038,147 @@ impl App {
         self.invalidate();
     }
 
-    fn open_location_view_index(&mut self, vi: usize) {
-        let Some(v) = self.view.get(vi) else { return };
-        let target = v.entry.target.clone();
+    fn open_location_entry(&mut self, entry: &AppEntry) {
+        let target = entry.target.clone();
         if target.starts_with("shell:") {
             return;
         }
         self.hide();
         open_shell_path("open", "explorer.exe", Some(&format!("/select,\"{target}\"")));
+    }
+
+    /// 新建文件夹并自动跳转到该文件夹所在分页。
+    pub fn create_folder_and_focus(&mut self, name: &str) {
+        let Some(fid) = self.settings.create_folder(name) else {
+            return;
+        };
+        if !self.store.save_settings(&self.settings) {
+            self.show_error("保存文件夹设置失败。");
+        }
+        if !self.query().is_empty() {
+            unsafe {
+                let _ = SetWindowTextW(self.edit, w!(""));
+            }
+        }
+        self.open_folder_id = None;
+        self.rebuild_view();
+        self.focus_folder_page(&fid);
+        self.request_page_icons();
+        self.invalidate();
+    }
+
+    /// 重命名文件夹并保持或定位到目标分页。
+    pub fn rename_folder_and_focus(&mut self, folder_id: &str, name: &str) {
+        if !self.settings.rename_folder(folder_id, name) {
+            return;
+        }
+        if !self.store.save_settings(&self.settings) {
+            self.show_error("保存文件夹设置失败。");
+        }
+        self.rebuild_view();
+        if self.open_folder_id.as_deref() != Some(folder_id) {
+            self.focus_folder_page(folder_id);
+        }
+        self.request_page_icons();
+        self.invalidate();
+    }
+
+    fn delete_folder(&mut self, folder_id: &str) {
+        if !self.settings.delete_folder(folder_id) {
+            return;
+        }
+        if self.open_folder_id.as_deref() == Some(folder_id) {
+            self.open_folder_id = None;
+            self.folder_page = 0;
+            self.folder_selected = None;
+        }
+        if !self.store.save_settings(&self.settings) {
+            self.show_error("保存文件夹设置失败。");
+        }
+        self.rebuild_view();
+        self.request_page_icons();
+        self.invalidate();
+    }
+
+    fn focus_folder_page(&mut self, folder_id: &str) {
+        if let Some(pos) = (0..self.filtered.len()).position(|p| self.filtered_id_at(p) == Some(folder_id)) {
+            let target_page = pos / self.per_page();
+            self.selected = Some(pos);
+            if self.visible && target_page != self.page {
+                self.goto_page(target_page);
+            } else {
+                self.page = target_page;
+            }
+        }
+    }
+
+    fn find_drop_folder_on_page(&self, x: i32, y: i32) -> Option<String> {
+        let count = self.page_items().len();
+        for (i, cell) in self.layout.cells.iter().enumerate().take(count) {
+            if inside_rect(cell, x, y) {
+                if let Some(pos) = self.page_cell_to_filtered(i) {
+                    if let Some(GridEntryRef::Folder { id, .. }) = self.entry_at_filtered(pos) {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn folder_name_by_id(&self, folder_id: &str) -> Option<&str> {
+        self.settings
+            .folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.name.as_str())
+    }
+
+    fn move_folder_selection(&mut self, dx: i32, dy: i32) {
+        let Some((fl, pages)) = self.open_folder_layout() else {
+            return;
+        };
+        let Some((_, _, apps)) = self.open_folder_ref() else {
+            return;
+        };
+        let total = apps.len();
+        if total == 0 {
+            return;
+        }
+        let cols = fl.cols.max(1);
+        let per = fl.cells.len().max(1);
+        if self.folder_selected.is_none() {
+            let start = self.folder_page * per;
+            if start < total {
+                self.folder_selected = Some(start);
+                self.invalidate();
+            }
+            return;
+        }
+        let cur = self.folder_selected.unwrap() as i32;
+        let next = (cur + dy * cols + dx).clamp(0, total as i32 - 1) as usize;
+        self.folder_selected = Some(next);
+        self.folder_page = (next / per).min(pages.saturating_sub(1));
+        self.request_open_folder_icons();
+        self.invalidate();
+    }
+
+    fn change_folder_page(&mut self, delta: i32) {
+        let Some((_, pages)) = self.open_folder_layout() else {
+            return;
+        };
+        if pages <= 1 {
+            return;
+        }
+        let next = (self.folder_page as i32 + delta).clamp(0, pages as i32 - 1) as usize;
+        if next != self.folder_page {
+            self.folder_page = next;
+            self.folder_hover = None;
+            self.pressed_folder = None;
+            self.cancel_tooltip();
+            self.request_open_folder_icons();
+            self.invalidate();
+        }
     }
 
     fn move_selection(&mut self, dx: i32, dy: i32) {
@@ -1838,35 +2305,7 @@ impl App {
         }
     }
 
-    fn update_tooltip_target(&mut self, hit: Hit) {
-        let next: Option<(TipTarget, RECT, String)> = match hit {
-            Hit::Add => Some((TipTarget::Add, self.layout.add_btn, "添加应用".into())),
-            Hit::Settings => Some((TipTarget::Settings, self.layout.settings_btn, "打开设置".into())),
-            Hit::Dot(i) => Some((
-                TipTarget::Dot(i),
-                dot_rect(&self.layout, i, self.pages(), self.scale),
-                format!("第 {} 页", i + 1),
-            )),
-            Hit::Cell(i) => {
-                if let Some(vi) = self.page_index_to_view(i) {
-                    let name = &self.view[vi].entry.name;
-                    if self.renderer.is_label_truncated(name, &self.layout) || !self.view[vi].valid {
-                        let vr = cell_visual_rect(&self.layout.cells[i], self.layout.icon_size, self.scale);
-                        let tip = if self.view[vi].valid {
-                            name.clone()
-                        } else {
-                            format!("{name}（目标文件已失效）")
-                        };
-                        Some((TipTarget::Cell(i), vr, tip))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+    fn set_pending_tooltip(&mut self, next: Option<(TipTarget, RECT, String)>) {
         let same = match (&self.tip_pending, &next) {
             (Some((a, _, _)), Some((b, _, _))) => a == b,
             (None, None) => true,
@@ -1886,23 +2325,162 @@ impl App {
         self.invalidate();
     }
 
-    fn open_context_menu(&mut self, hit: Hit, pt: POINT) {
-        self.cancel_tooltip();
-        self.menu_target = match hit {
-            Hit::Cell(i) => self.page_index_to_view(i),
+    fn update_tooltip_target(&mut self, hit: Hit) {
+        let next: Option<(TipTarget, RECT, String)> = match hit {
+            Hit::NewFolder => Some((TipTarget::NewFolder, self.layout.new_folder_btn, "新建文件夹".into())),
+            Hit::Add => Some((TipTarget::Add, self.layout.add_btn, "添加应用".into())),
+            Hit::Settings => Some((TipTarget::Settings, self.layout.settings_btn, "打开设置".into())),
+            Hit::Dot(i) => Some((
+                TipTarget::Dot(i),
+                dot_rect(&self.layout, i, self.pages(), self.scale),
+                format!("第 {} 页", i + 1),
+            )),
+            Hit::Cell(i) => {
+                if let Some(pos) = self.page_cell_to_filtered(i) {
+                    match self.entry_at_filtered(pos) {
+                        Some(GridEntryRef::App(v)) => {
+                            if self.renderer.is_label_truncated(&v.entry.name, &self.layout) || !v.valid {
+                                let vr = cell_visual_rect(&self.layout.cells[i], self.layout.icon_size, self.scale);
+                                let tip = if v.valid {
+                                    v.entry.name.clone()
+                                } else {
+                                    format!("{}（目标文件已失效）", v.entry.name)
+                                };
+                                Some((TipTarget::Cell(i), vr, tip))
+                            } else {
+                                None
+                            }
+                        }
+                        Some(GridEntryRef::Folder { name, .. }) => {
+                            if self.renderer.is_label_truncated(name, &self.layout) {
+                                let vr = cell_visual_rect(&self.layout.cells[i], self.layout.icon_size, self.scale);
+                                Some((TipTarget::Cell(i), vr, name.to_string()))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
-        let mut items = Vec::new();
-        if let Some(vi) = self.menu_target {
-            items.push(ContextItem { cmd: ContextCmd::Open, label: "打开", danger: false });
-            if !self.view[vi].entry.target.starts_with("shell:") {
-                items.push(ContextItem { cmd: ContextCmd::OpenLocation, label: "打开文件位置", danger: false });
+        self.set_pending_tooltip(next);
+    }
+
+    fn update_folder_tooltip_target(&mut self, hit: FolderHit) {
+        let Some((fl, pages)) = self.open_folder_layout() else {
+            self.set_pending_tooltip(None);
+            return;
+        };
+        let next: Option<(TipTarget, RECT, String)> = match hit {
+            FolderHit::Title => Some((TipTarget::FolderTitle, fl.title_rc, "点击重命名文件夹".into())),
+            FolderHit::Close => Some((TipTarget::FolderClose, fl.close_btn, "关闭文件夹".into())),
+            FolderHit::Dot(i) => Some((
+                TipTarget::FolderDot(i),
+                folder_dot_rect(&fl, i, pages, self.scale),
+                format!("第 {} 页", i + 1),
+            )),
+            FolderHit::Cell(i) => {
+                let per = fl.cells.len().max(1);
+                let idx = self.folder_page * per + i;
+                if let Some((_, _, apps)) = self.open_folder_ref() {
+                    if let Some(v) = apps.get(idx) {
+                        let cell_w = fl.cells.first().map(|c| c.right - c.left).unwrap_or(110);
+                        if self.renderer.is_label_truncated_in_cell(&v.entry.name, cell_w) || !v.valid {
+                            let vr = cell_visual_rect(&fl.cells[i], fl.icon_size, self.scale);
+                            let tip = if v.valid {
+                                v.entry.name.clone()
+                            } else {
+                                format!("{}（目标文件已失效）", v.entry.name)
+                            };
+                            Some((TipTarget::FolderCell(i), vr, tip))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-            items.push(ContextItem { cmd: ContextCmd::Remove, label: "从启动台移除", danger: true });
-        } else {
+            _ => None,
+        };
+        self.set_pending_tooltip(next);
+    }
+
+    fn open_context_menu(&mut self, hit: Hit, pt: POINT) {
+        self.cancel_tooltip();
+        self.menu_app_target = None;
+        self.menu_folder_target = None;
+        let mut items = Vec::new();
+        if let Hit::Cell(i) = hit {
+            if let Some(pos) = self.page_cell_to_filtered(i) {
+                match self.entry_at_filtered(pos) {
+                    Some(GridEntryRef::App(v)) => {
+                        let v = v.clone();
+                        items.push(ContextItem { cmd: ContextCmd::Open, label: "打开", danger: false });
+                        if !v.entry.target.starts_with("shell:") {
+                            items.push(ContextItem { cmd: ContextCmd::OpenLocation, label: "打开文件位置", danger: false });
+                        }
+                        items.push(ContextItem { cmd: ContextCmd::Remove, label: "从启动台移除", danger: true });
+                        self.menu_app_target = Some(v);
+                    }
+                    Some(GridEntryRef::Folder { id, .. }) => {
+                        self.menu_folder_target = Some(id.to_string());
+                        items.push(ContextItem { cmd: ContextCmd::OpenFolder, label: "打开文件夹", danger: false });
+                        items.push(ContextItem { cmd: ContextCmd::RenameFolder, label: "重命名", danger: false });
+                        items.push(ContextItem { cmd: ContextCmd::DeleteFolder, label: "删除文件夹", danger: true });
+                    }
+                    None => {}
+                }
+            }
+        }
+        if items.is_empty() {
             items.push(ContextItem { cmd: ContextCmd::Add, label: "添加应用", danger: false });
+            items.push(ContextItem { cmd: ContextCmd::NewFolder, label: "新建文件夹", danger: false });
             items.push(ContextItem { cmd: ContextCmd::Rescan, label: "刷新应用图标", danger: false });
             items.push(ContextItem { cmd: ContextCmd::Settings, label: "设置", danger: false });
+        }
+        self.context_menu = Some(ContextMenu::build(
+            pt.x,
+            pt.y,
+            self.layout.w,
+            self.layout.h,
+            items,
+            self.scale,
+        ));
+        self.invalidate();
+    }
+
+    fn open_folder_context_menu(&mut self, hit: FolderHit, pt: POINT) {
+        self.cancel_tooltip();
+        self.menu_app_target = None;
+        self.menu_folder_target = self.open_folder_id.clone();
+        let mut items = Vec::new();
+        if let FolderHit::Cell(i) = hit {
+            if let Some((fl, _)) = self.open_folder_layout() {
+                let per = fl.cells.len().max(1);
+                let idx = self.folder_page * per + i;
+                if let Some((_, _, apps)) = self.open_folder_ref() {
+                    if let Some(v) = apps.get(idx).cloned() {
+                        items.push(ContextItem { cmd: ContextCmd::Open, label: "打开", danger: false });
+                        if !v.entry.target.starts_with("shell:") {
+                            items.push(ContextItem { cmd: ContextCmd::OpenLocation, label: "打开文件位置", danger: false });
+                        }
+                        items.push(ContextItem { cmd: ContextCmd::RemoveFromFolder, label: "移出文件夹", danger: false });
+                        items.push(ContextItem { cmd: ContextCmd::Remove, label: "从启动台移除", danger: true });
+                        self.menu_app_target = Some(v);
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            items.push(ContextItem { cmd: ContextCmd::RenameFolder, label: "重命名文件夹", danger: false });
+            items.push(ContextItem { cmd: ContextCmd::CloseFolder, label: "关闭文件夹", danger: false });
         }
         self.context_menu = Some(ContextMenu::build(
             pt.x,
@@ -1919,23 +2497,54 @@ impl App {
         self.context_menu = None;
         match cmd {
             ContextCmd::Open => {
-                if let Some(v) = self.menu_target.take() {
-                    self.launch_view_index(v);
+                if let Some(v) = self.menu_app_target.take() {
+                    self.launch_visible_item(&v);
                 }
             }
             ContextCmd::OpenLocation => {
-                if let Some(v) = self.menu_target.take() {
-                    self.open_location_view_index(v);
+                if let Some(v) = self.menu_app_target.take() {
+                    self.open_location_entry(&v.entry);
                 }
             }
             ContextCmd::Remove => {
-                if let Some(v) = self.menu_target.take() {
-                    self.remove_view_index(v);
+                if let Some(v) = self.menu_app_target.take() {
+                    self.remove_app_entry(&v.entry);
+                }
+            }
+            ContextCmd::RemoveFromFolder => {
+                if let Some(v) = self.menu_app_target.take() {
+                    if self.settings.remove_app_from_folders(&v.entry.id) {
+                        self.store.save_settings(&self.settings);
+                        self.rebuild_view();
+                        self.request_page_icons();
+                    }
+                    self.invalidate();
                 }
             }
             ContextCmd::Add => crate::add::open(self),
+            ContextCmd::NewFolder => crate::folder_dialog::open_create(self),
             ContextCmd::Rescan => self.start_scan(),
             ContextCmd::Settings => crate::settings::open(self),
+            ContextCmd::OpenFolder => {
+                if let Some(fid) = self.menu_folder_target.take() {
+                    self.open_folder(fid);
+                }
+            }
+            ContextCmd::RenameFolder => {
+                if let Some(fid) = self.menu_folder_target.take() {
+                    if let Some(name) = self.folder_name_by_id(&fid).map(str::to_string) {
+                        crate::folder_dialog::open_rename(self, fid, name);
+                    }
+                }
+            }
+            ContextCmd::DeleteFolder => {
+                if let Some(fid) = self.menu_folder_target.take() {
+                    self.delete_folder(&fid);
+                }
+            }
+            ContextCmd::CloseFolder => {
+                self.close_open_folder();
+            }
         }
     }
 
@@ -2031,6 +2640,7 @@ impl App {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_AUTO_SCAN);
             let _ = KillTimer(self.hwnd, TIMER_AUTO_UPDATE);
+            let _ = KillTimer(self.hwnd, TIMER_DRAG_EDGE);
         }
         if let Some(mut w) = self.watcher.take() {
             w.stop();
@@ -2088,28 +2698,94 @@ impl App {
             String::new()
         };
         let tip = self.tip_visible.as_ref().map(|(r, s)| (*r, s.as_str()));
+        let hidden_app_id = self
+            .icon_drag
+            .as_ref()
+            .filter(|d| d.moved)
+            .map(|d| d.app_id.as_str());
+        let drop_folder_id = self
+            .icon_drag
+            .as_ref()
+            .filter(|d| d.moved)
+            .and_then(|d| d.target_folder_id.as_deref());
+        let drag_hint: Option<String> = self.icon_drag.as_ref().filter(|d| d.moved).and_then(|d| {
+            if d.from_folder.is_some() {
+                if d.outside_folder {
+                    Some("移出文件夹".to_string())
+                } else {
+                    None
+                }
+            } else {
+                d.target_folder_id
+                    .as_deref()
+                    .and_then(|fid| self.folder_name_by_id(fid))
+                    .map(|fname| format!("放入「{fname}」"))
+            }
+        });
+        let drag_ghost = self.icon_drag.as_ref().filter(|d| d.moved).map(|d| DragGhost {
+            icon_key: &d.icon_key,
+            name: &d.name,
+            x: d.cur_x,
+            y: d.cur_y,
+            hint: drag_hint.as_deref(),
+        });
+        let open_folder_info = self.open_folder_layout().and_then(|(fl, pages)| {
+            let (_, name, _) = self.open_folder_ref()?;
+            let per = fl.cells.len().max(1);
+            let folder_items = self.open_folder_page_items(per, self.folder_page);
+            let outside_drag = self
+                .icon_drag
+                .as_ref()
+                .is_some_and(|d| d.moved && d.from_folder.is_some() && d.outside_folder);
+            Some((fl, pages, name.to_string(), folder_items, outside_drag))
+        });
+        let open_folder = open_folder_info.as_ref().map(|(fl, pages, title, folder_items, outside_drag)| {
+            let per = fl.cells.len().max(1);
+            OpenFolderFrame {
+                layout: fl,
+                title,
+                items: folder_items,
+                page: self.folder_page,
+                pages: *pages,
+                hover: self.folder_hover,
+                pressed: self.pressed_folder,
+                selected: self
+                    .folder_selected
+                    .map(|s| s.saturating_sub(self.folder_page * per))
+                    .filter(|s| *s < per),
+                hidden_app_id,
+                outside_drag: *outside_drag,
+            }
+        });
         let frame = Frame {
             items: &items,
             neighbor_items: &neighbor_items,
             neighbor_offset,
             slide_x: self.slide_x,
-            hover: self.hover,
-            pressed_cell: self.pressed_cell,
-            selected: self
-                .selected
-                .map(|s| s.saturating_sub(self.page * self.per_page()))
-                .filter(|s| *s < self.per_page()),
+            hover: if self.open_folder_id.is_some() { None } else { self.hover },
+            pressed_cell: if self.open_folder_id.is_some() { None } else { self.pressed_cell },
+            selected: if self.open_folder_id.is_some() {
+                None
+            } else {
+                self.selected
+                    .map(|s| s.saturating_sub(self.page * self.per_page()))
+                    .filter(|s| *s < self.per_page())
+            },
             page: self.page,
             pages: self.pages(),
             query_empty: q.is_empty() && !self.edit_composing,
             status: &status,
             empty_text: &empty_text,
-            hover_btn: self.hover_btn,
-            pressed_btn: self.pressed,
+            hover_btn: if self.open_folder_id.is_some() { None } else { self.hover_btn },
+            pressed_btn: if self.open_folder_id.is_some() { None } else { self.pressed },
             tooltip: tip,
             context_menu: self.context_menu.as_ref(),
             use_wallpaper: self.settings.use_wallpaper_blur,
             icon_roundness: self.settings.icon_roundness,
+            hidden_app_id,
+            drop_folder_id,
+            open_folder,
+            drag_ghost,
         };
         if !self.renderer.paint(self.hwnd, &frame, &self.layout) {
             self.request_page_icons();
@@ -2206,14 +2882,16 @@ impl App {
             }
             WM_SETCURSOR => {
                 unsafe {
-                    let mut pt = POINT::default();
-                    if GetCursorPos(&mut pt).is_ok() {
-                        let mut cli = pt;
-                        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut cli);
-                        let sr = self.layout.search;
-                        if cli.x >= sr.left && cli.x < sr.right && cli.y >= sr.top && cli.y < sr.bottom {
-                            let _ = SetCursor(LoadCursorW(None, IDC_IBEAM).unwrap_or_default());
-                            return LRESULT(1);
+                    if self.open_folder_id.is_none() && self.icon_drag.is_none() {
+                        let mut pt = POINT::default();
+                        if GetCursorPos(&mut pt).is_ok() {
+                            let mut cli = pt;
+                            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut cli);
+                            let sr = self.layout.search;
+                            if cli.x >= sr.left && cli.x < sr.right && cli.y >= sr.top && cli.y < sr.bottom {
+                                let _ = SetCursor(LoadCursorW(None, IDC_IBEAM).unwrap_or_default());
+                                return LRESULT(1);
+                            }
                         }
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
@@ -2333,6 +3011,36 @@ impl App {
                     TIMER_AUTO_UPDATE => {
                         self.start_auto_update_check();
                     }
+                    TIMER_DRAG_EDGE => {
+                        let flip_dir = self.icon_drag.as_ref().and_then(|d| {
+                            if d.moved
+                                && d.from_folder.is_none()
+                                && d.edge_dir != 0
+                                && d.edge_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(450))
+                            {
+                                Some(d.edge_dir)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(dir) = flip_dir {
+                            self.change_page(dir);
+                            if let Some(d) = self.icon_drag.as_mut() {
+                                d.edge_since = Some(Instant::now());
+                            }
+                            if let Some(d) = self.icon_drag.as_ref() {
+                                let next_target = self.find_drop_folder_on_page(d.cur_x, d.cur_y);
+                                if let Some(dm) = self.icon_drag.as_mut() {
+                                    dm.target_folder_id = next_target;
+                                }
+                            }
+                            self.invalidate();
+                        } else if self.icon_drag.as_ref().is_none_or(|d| d.edge_dir == 0) {
+                            unsafe {
+                                let _ = KillTimer(self.hwnd, TIMER_DRAG_EDGE);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -2435,6 +3143,13 @@ impl App {
                     return LRESULT(0);
                 }
                 if lparam.0 as isize == self.edit.0 as isize && hiword(wparam.0) as u32 == EN_CHANGE {
+                    if !self.query().trim().is_empty() {
+                        self.open_folder_id = None;
+                        self.folder_page = 0;
+                        self.folder_hover = None;
+                        self.pressed_folder = None;
+                        self.folder_selected = None;
+                    }
                     self.rebuild_filtered(true);
                     if self.visible {
                         self.invalidate();
@@ -2468,6 +3183,77 @@ impl App {
                     if nh != menu.hover {
                         menu.hover = nh;
                         self.track_mouse_leave();
+                        self.invalidate();
+                    }
+                    return LRESULT(0);
+                }
+                if self.icon_drag.is_some() {
+                    let thresh = (6.0 * self.scale).round() as i32;
+                    let mut became_moved = false;
+                    let mut from_folder = false;
+                    if let Some(drag) = self.icon_drag.as_mut() {
+                        drag.cur_x = pt.x;
+                        drag.cur_y = pt.y;
+                        if !drag.moved
+                            && (pt.x - drag.start_x).abs().max((pt.y - drag.start_y).abs()) >= thresh
+                        {
+                            drag.moved = true;
+                            became_moved = true;
+                        }
+                        from_folder = drag.from_folder.is_some();
+                    }
+                    if became_moved {
+                        self.pressed = None;
+                        self.pressed_cell = None;
+                        self.pressed_folder = None;
+                        self.hover = None;
+                        self.hover_btn = None;
+                        self.folder_hover = None;
+                        self.cancel_tooltip();
+                    }
+                    if self.icon_drag.as_ref().is_some_and(|d| d.moved) {
+                        if from_folder {
+                            let outside = self
+                                .open_folder_layout()
+                                .is_some_and(|(fl, _)| !inside_rect(&fl.card, pt.x, pt.y));
+                            if let Some(drag) = self.icon_drag.as_mut() {
+                                drag.outside_folder = outside;
+                                drag.target_folder_id = None;
+                            }
+                        } else {
+                            let target_fid = self.find_drop_folder_on_page(pt.x, pt.y);
+                            let edge_margin = (48.0 * self.scale).round() as i32;
+                            let new_edge = if pt.x < edge_margin && self.page > 0 {
+                                -1
+                            } else if pt.x > self.layout.w - edge_margin && self.page + 1 < self.pages() {
+                                1
+                            } else {
+                                0
+                            };
+                            let mut start_edge_timer = false;
+                            let mut stop_edge_timer = false;
+                            if let Some(drag) = self.icon_drag.as_mut() {
+                                drag.target_folder_id = target_fid;
+                                drag.outside_folder = false;
+                                if new_edge != drag.edge_dir {
+                                    drag.edge_dir = new_edge;
+                                    if new_edge != 0 {
+                                        drag.edge_since = Some(Instant::now());
+                                        start_edge_timer = true;
+                                    } else {
+                                        drag.edge_since = None;
+                                        stop_edge_timer = true;
+                                    }
+                                }
+                            }
+                            unsafe {
+                                if start_edge_timer {
+                                    let _ = SetTimer(self.hwnd, TIMER_DRAG_EDGE, 120, None);
+                                } else if stop_edge_timer {
+                                    let _ = KillTimer(self.hwnd, TIMER_DRAG_EDGE);
+                                }
+                            }
+                        }
                         self.invalidate();
                     }
                     return LRESULT(0);
@@ -2524,6 +3310,18 @@ impl App {
                     }
                     return LRESULT(0);
                 }
+                if let Some((fl, pages)) = self.open_folder_layout() {
+                    let per = fl.cells.len().max(1);
+                    let fcount = self.open_folder_page_items(per, self.folder_page).len();
+                    let fhit = folder_hit_test(&fl, pt.x, pt.y, fcount, pages, self.scale);
+                    self.update_folder_tooltip_target(fhit);
+                    if self.folder_hover != Some(fhit) {
+                        self.folder_hover = Some(fhit);
+                        self.track_mouse_leave();
+                        self.invalidate();
+                    }
+                    return LRESULT(0);
+                }
                 let page_count = self.page_items().len();
                 let pages = self.pages();
                 let hit = hit_test(&self.layout, pt.x, pt.y, page_count, pages, self.scale);
@@ -2532,7 +3330,7 @@ impl App {
                     _ => None,
                 };
                 let hover_btn = match hit {
-                    Hit::Add | Hit::Settings | Hit::Dot(_) => Some(hit),
+                    Hit::NewFolder | Hit::Add | Hit::Settings | Hit::Dot(_) => Some(hit),
                     _ => None,
                 };
                 self.update_tooltip_target(hit);
@@ -2546,9 +3344,10 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 self.cancel_tooltip();
-                if self.hover.is_some() || self.hover_btn.is_some() {
+                if self.hover.is_some() || self.hover_btn.is_some() || self.folder_hover.is_some() {
                     self.hover = None;
                     self.hover_btn = None;
+                    self.folder_hover = None;
                     self.invalidate();
                 }
                 LRESULT(0)
@@ -2560,7 +3359,11 @@ impl App {
                     return LRESULT(0);
                 }
                 let delta = get_wheel_delta(wparam.0);
-                self.change_page(if delta > 0 { -1 } else { 1 });
+                if self.open_folder_id.is_some() {
+                    self.change_folder_page(if delta > 0 { -1 } else { 1 });
+                } else {
+                    self.change_page(if delta > 0 { -1 } else { 1 });
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
@@ -2579,6 +3382,42 @@ impl App {
                     }
                     return LRESULT(0);
                 }
+                if let Some((fl, pages)) = self.open_folder_layout() {
+                    let per = fl.cells.len().max(1);
+                    let fcount = self.open_folder_page_items(per, self.folder_page).len();
+                    let fhit = folder_hit_test(&fl, pt.x, pt.y, fcount, pages, self.scale);
+                    self.pressed_folder = Some(fhit);
+                    if let FolderHit::Cell(i) = fhit {
+                        let idx = self.folder_page * per + i;
+                        if let Some((fid, _, apps)) = self.open_folder_ref() {
+                            if let Some(v) = apps.get(idx) {
+                                self.icon_drag = Some(IconDrag {
+                                    app_id: v.entry.id.clone(),
+                                    icon_key: v.entry.icon_key.clone(),
+                                    name: v.entry.name.clone(),
+                                    from_folder: Some(fid.to_string()),
+                                    start_x: pt.x,
+                                    start_y: pt.y,
+                                    cur_x: pt.x,
+                                    cur_y: pt.y,
+                                    moved: false,
+                                    target_folder_id: None,
+                                    outside_folder: false,
+                                    edge_dir: 0,
+                                    edge_since: None,
+                                });
+                                unsafe {
+                                    let _ = SetCapture(self.hwnd);
+                                }
+                            }
+                        }
+                    }
+                    unsafe {
+                        let _ = SetFocus(self.edit);
+                    }
+                    self.invalidate();
+                    return LRESULT(0);
+                }
                 let page_count = self.page_items().len();
                 let pages = self.pages();
                 let hit = hit_test(&self.layout, pt.x, pt.y, page_count, pages, self.scale);
@@ -2587,7 +3426,52 @@ impl App {
                     Hit::Cell(i) => Some(i),
                     _ => None,
                 };
-                if matches!(hit, Hit::Cell(_) | Hit::Blank) {
+                let start_app_drag = if let Hit::Cell(i) = hit {
+                    if !self.settings.folders.is_empty() {
+                        if let Some(pos) = self.page_cell_to_filtered(i) {
+                            if let Some(GridEntryRef::App(v)) = self.entry_at_filtered(pos) {
+                                Some(v.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(v) = start_app_drag {
+                    if self.slide_anim {
+                        self.slide_anim = false;
+                        self.slide_vx = 0.0;
+                        unsafe {
+                            let _ = KillTimer(self.hwnd, TIMER_SLIDE);
+                        }
+                        self.sync_hi_res_timer();
+                    }
+                    self.icon_drag = Some(IconDrag {
+                        app_id: v.entry.id.clone(),
+                        icon_key: v.entry.icon_key.clone(),
+                        name: v.entry.name.clone(),
+                        from_folder: None,
+                        start_x: pt.x,
+                        start_y: pt.y,
+                        cur_x: pt.x,
+                        cur_y: pt.y,
+                        moved: false,
+                        target_folder_id: None,
+                        outside_folder: false,
+                        edge_dir: 0,
+                        edge_since: None,
+                    });
+                    unsafe {
+                        let _ = SetCapture(self.hwnd);
+                    }
+                } else if matches!(hit, Hit::Cell(_) | Hit::Blank) {
                     // 若在滑页动画途中按下鼠标，立即接管当前偏移量实现零中断抓停
                     if self.slide_anim {
                         self.slide_anim = false;
@@ -2620,6 +3504,32 @@ impl App {
                     x: get_x_lparam(lparam.0),
                     y: get_y_lparam(lparam.0),
                 };
+                if let Some(drag) = self.icon_drag.take() {
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, TIMER_DRAG_EDGE);
+                        let _ = ReleaseCapture();
+                    }
+                    if drag.moved {
+                        self.pressed = None;
+                        self.pressed_cell = None;
+                        self.pressed_folder = None;
+                        if drag.from_folder.is_some() {
+                            if drag.outside_folder && self.settings.remove_app_from_folders(&drag.app_id) {
+                                self.store.save_settings(&self.settings);
+                                self.rebuild_view();
+                                self.request_page_icons();
+                            }
+                        } else if let Some(fid) = drag.target_folder_id {
+                            if self.settings.move_app_to_folder(&drag.app_id, &fid) {
+                                self.store.save_settings(&self.settings);
+                                self.rebuild_view();
+                                self.request_page_icons();
+                            }
+                        }
+                        self.invalidate();
+                        return LRESULT(0);
+                    }
+                }
                 if self.drag_active {
                     self.drag_active = false;
                     unsafe {
@@ -2670,6 +3580,46 @@ impl App {
                     self.drag_base_x = 0.0;
                 }
 
+                if let Some((fl, pages)) = self.open_folder_layout() {
+                    let per = fl.cells.len().max(1);
+                    let fcount = self.open_folder_page_items(per, self.folder_page).len();
+                    let fhit = folder_hit_test(&fl, pt.x, pt.y, fcount, pages, self.scale);
+                    let pressed = self.pressed_folder.take();
+                    if pressed == Some(fhit) {
+                        match fhit {
+                            FolderHit::Close | FolderHit::Outside => {
+                                self.close_open_folder();
+                                return LRESULT(0);
+                            }
+                            FolderHit::Title => {
+                                if let Some((fid, name, _)) = self.open_folder_ref() {
+                                    let (fid, name) = (fid.to_string(), name.to_string());
+                                    self.invalidate();
+                                    crate::folder_dialog::open_rename(self, fid, name);
+                                    return LRESULT(0);
+                                }
+                            }
+                            FolderHit::Dot(p) => {
+                                if p != self.folder_page && p < pages {
+                                    self.folder_page = p;
+                                    self.request_open_folder_icons();
+                                }
+                            }
+                            FolderHit::Cell(i) => {
+                                let idx = self.folder_page * per + i;
+                                self.folder_selected = Some(idx);
+                                if let Some(item) = self.open_folder_ref().and_then(|(_, _, apps)| apps.get(idx).cloned()) {
+                                    self.launch_visible_item(&item);
+                                    return LRESULT(0);
+                                }
+                            }
+                            FolderHit::Inside => {}
+                        }
+                    }
+                    self.invalidate();
+                    return LRESULT(0);
+                }
+
                 let page_count = self.page_items().len();
                 let pages = self.pages();
                 let hit = hit_test(&self.layout, pt.x, pt.y, page_count, pages, self.scale);
@@ -2678,13 +3628,33 @@ impl App {
                 if pressed.is_some() && pressed == Some(hit) {
                     match hit {
                         Hit::Cell(i) => {
-                            self.selected = Some(self.page * self.per_page() + i);
-                            if let Some(vi) = self.page_index_to_view(i) {
-                                self.launch_view_index(vi);
+                            if let Some(pos) = self.page_cell_to_filtered(i) {
+                                self.selected = Some(pos);
+                                match self.entry_at_filtered(pos) {
+                                    Some(GridEntryRef::App(v)) => {
+                                        let item = v.clone();
+                                        self.launch_visible_item(&item);
+                                    }
+                                    Some(GridEntryRef::Folder { id, .. }) => {
+                                        let fid = id.to_string();
+                                        self.open_folder(fid);
+                                    }
+                                    None => {}
+                                }
                             }
                         }
-                        Hit::Add => crate::add::open(self),
-                        Hit::Settings => crate::settings::open(self),
+                        Hit::NewFolder => {
+                            self.invalidate();
+                            crate::folder_dialog::open_create(self);
+                        }
+                        Hit::Add => {
+                            self.invalidate();
+                            crate::add::open(self);
+                        }
+                        Hit::Settings => {
+                            self.invalidate();
+                            crate::settings::open(self);
+                        }
                         Hit::Dot(p) => self.goto_page(p),
                         Hit::Search => unsafe {
                             let _ = SetFocus(self.edit);
@@ -2704,11 +3674,25 @@ impl App {
                     x: get_x_lparam(lparam.0),
                     y: get_y_lparam(lparam.0),
                 };
+                if let Some((fl, pages)) = self.open_folder_layout() {
+                    let per = fl.cells.len().max(1);
+                    let fcount = self.open_folder_page_items(per, self.folder_page).len();
+                    let fhit = folder_hit_test(&fl, pt.x, pt.y, fcount, pages, self.scale);
+                    if fhit == FolderHit::Outside {
+                        self.close_open_folder();
+                    } else {
+                        if let FolderHit::Cell(i) = fhit {
+                            self.folder_selected = Some(self.folder_page * per + i);
+                        }
+                        self.open_folder_context_menu(fhit, pt);
+                    }
+                    return LRESULT(0);
+                }
                 let page_count = self.page_items().len();
                 let pages = self.pages();
                 let hit = hit_test(&self.layout, pt.x, pt.y, page_count, pages, self.scale);
                 if let Hit::Cell(i) = hit {
-                    self.selected = Some(self.page * self.per_page() + i);
+                    self.selected = self.page_cell_to_filtered(i);
                 }
                 self.open_context_menu(hit, pt);
                 LRESULT(0)
@@ -2771,6 +3755,8 @@ impl App {
                             if self.context_menu.is_some() {
                                 self.context_menu = None;
                                 self.invalidate();
+                            } else if self.open_folder_id.is_some() {
+                                self.close_open_folder();
                             } else {
                                 self.hide();
                             }
@@ -2781,28 +3767,64 @@ impl App {
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     let vk = wparam.0 as u32;
-                    let editing_text = self.selected.is_none() && !self.query().is_empty();
+                    let editing_text = self.open_folder_id.is_none()
+                        && self.selected.is_none()
+                        && !self.query().is_empty();
                     match vk {
                         x if x == VK_LEFT.0 as u32 => {
                             if editing_text {
                                 return false;
                             }
-                            self.move_selection(-1, 0);
+                            if self.open_folder_id.is_some() {
+                                self.move_folder_selection(-1, 0);
+                            } else {
+                                self.move_selection(-1, 0);
+                            }
                         }
                         x if x == VK_RIGHT.0 as u32 => {
                             if editing_text {
                                 return false;
                             }
-                            self.move_selection(1, 0);
+                            if self.open_folder_id.is_some() {
+                                self.move_folder_selection(1, 0);
+                            } else {
+                                self.move_selection(1, 0);
+                            }
                         }
-                        x if x == VK_DOWN.0 as u32 => self.move_selection(0, 1),
-                        x if x == VK_UP.0 as u32 => self.move_selection(0, -1),
-                        x if x == VK_PRIOR.0 as u32 => self.change_page(-1),
-                        x if x == VK_NEXT.0 as u32 => self.change_page(1),
+                        x if x == VK_DOWN.0 as u32 => {
+                            if self.open_folder_id.is_some() {
+                                self.move_folder_selection(0, 1);
+                            } else {
+                                self.move_selection(0, 1);
+                            }
+                        }
+                        x if x == VK_UP.0 as u32 => {
+                            if self.open_folder_id.is_some() {
+                                self.move_folder_selection(0, -1);
+                            } else {
+                                self.move_selection(0, -1);
+                            }
+                        }
+                        x if x == VK_PRIOR.0 as u32 => {
+                            if self.open_folder_id.is_some() {
+                                self.change_folder_page(-1);
+                            } else {
+                                self.change_page(-1);
+                            }
+                        }
+                        x if x == VK_NEXT.0 as u32 => {
+                            if self.open_folder_id.is_some() {
+                                self.change_folder_page(1);
+                            } else {
+                                self.change_page(1);
+                            }
+                        }
                         x if x == VK_ESCAPE.0 as u32 => {
                             if self.context_menu.is_some() {
                                 self.context_menu = None;
                                 self.invalidate();
+                            } else if self.open_folder_id.is_some() {
+                                self.close_open_folder();
                             } else {
                                 self.hide();
                             }
@@ -2945,4 +3967,83 @@ unsafe extern "system" fn edit_proc(
         }
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_app(id: &str, name: &str) -> AppEntry {
+        AppEntry {
+            id: id.into(),
+            name: name.into(),
+            source: Source::AppsFolder,
+            target: format!("shell:AppsFolder\\{id}"),
+            args: String::new(),
+            aliases: Vec::new(),
+            icon_key: String::new(),
+            folder_id: "apps_store".into(),
+            folder_name: "Microsoft Store 与常用应用".into(),
+        }
+    }
+
+    #[test]
+    fn grid_view_sorts_mixed_names_puts_folders_last_and_sorts_inside_folders() {
+        let entries = vec![
+            dummy_app("uwp:wechat", "微信"),
+            dummy_app("uwp:chrome", "Chrome"),
+            dummy_app("uwp:dingding", "钉钉"),
+            dummy_app("uwp:zoom", "Zoom"),
+            dummy_app("uwp:aqy", "爱奇艺"),
+            dummy_app("uwp:calc", "计算器"),
+        ];
+        let mut settings = Settings::default();
+        let f_work = settings.create_folder("办公").unwrap();
+        let f_alpha = settings.create_folder("DevTools").unwrap();
+        let f_ent = settings.create_folder("娱乐").unwrap();
+
+        assert!(settings.move_app_to_folder("uwp:wechat", &f_work));
+        assert!(settings.move_app_to_folder("uwp:chrome", &f_work));
+        assert!(settings.move_app_to_folder("uwp:dingding", &f_work));
+
+        let (view, all_apps) = build_grid_view(&entries, &settings);
+
+        // 全部应用集合应按中英文拼音字母混合顺序排列
+        let all_names: Vec<&str> = all_apps.iter().map(|v| v.entry.name.as_str()).collect();
+        assert_eq!(all_names, ["爱奇艺", "Chrome", "钉钉", "计算器", "微信", "Zoom"]);
+
+        // 独立图标排在文件夹之前，且按字母顺序排列
+        assert_eq!(view.len(), 6);
+        match (&view[0], &view[1], &view[2]) {
+            (GridEntry::App(a), GridEntry::App(b), GridEntry::App(c)) => {
+                assert_eq!(
+                    [a.entry.name.as_str(), b.entry.name.as_str(), c.entry.name.as_str()],
+                    ["爱奇艺", "计算器", "Zoom"]
+                );
+            }
+            _ => panic!("前 3 项应为独立图标"),
+        }
+
+        // 文件夹排在独立图标之后，且文件夹之间按中英文拼音字母顺序排列：办公(ban) < DevTools(dev) < 娱乐(yu)
+        let folder_names: Vec<&str> = view[3..]
+            .iter()
+            .map(|g| match g {
+                GridEntry::Folder { name, .. } => name.as_str(),
+                _ => panic!("后 3 项应为文件夹"),
+            })
+            .collect();
+        assert_eq!(folder_names, ["办公", "DevTools", "娱乐"]);
+
+        // 文件夹内部应用同样按中英文拼音字母顺序排列：Chrome < 钉钉 < 微信
+        match &view[3] {
+            GridEntry::Folder { id, apps, .. } => {
+                assert_eq!(id, &f_work);
+                let inside: Vec<&str> = apps.iter().map(|a| a.entry.name.as_str()).collect();
+                assert_eq!(inside, ["Chrome", "钉钉", "微信"]);
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(&view[4], GridEntry::Folder { id, apps, .. } if id == &f_alpha && apps.is_empty()));
+        assert!(matches!(&view[5], GridEntry::Folder { id, apps, .. } if id == &f_ent && apps.is_empty()));
+    }
 }
