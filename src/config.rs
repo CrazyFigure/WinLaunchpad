@@ -117,9 +117,10 @@ pub struct Settings {
     pub hotkey: HotkeySpec,
     #[serde(default = "default_true")]
     pub start_with_windows: bool,
-    #[serde(default)]
+    /// 是否启用全局右键手势（默认开启）。
+    #[serde(default = "default_true")]
     pub gestures_enabled: bool,
-    /// 左右手势切桌面方向反转
+    /// 左右手势切换桌面方向是否反转（默认关闭）。
     #[serde(default)]
     pub gesture_swap_lr: bool,
     /// 手势识别最低匹配度百分比（50..=95，默认 70）
@@ -175,7 +176,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             hotkey: HotkeySpec::default(),
             start_with_windows: true,
-            gestures_enabled: false,
+            gestures_enabled: true,
             gesture_swap_lr: false,
             gesture_threshold: DEFAULT_GESTURE_THRESHOLD,
             use_wallpaper_blur: true,
@@ -339,6 +340,30 @@ mod tests {
         assert!(s.refresh_changed_icons);
         assert!(s.auto_check_update);
         assert_eq!(s.gesture_threshold, 70);
+    }
+
+    #[test]
+    fn gesture_settings_default_to_enabled_without_reversing_desktops() {
+        // 首次运行和旧配置缺少手势字段时采用同一组默认值。
+        let fresh = Settings::default();
+        let legacy: Settings = serde_json::from_str(r#"{"version":2}"#).unwrap();
+
+        assert!(fresh.gestures_enabled);
+        assert!(!fresh.gesture_swap_lr);
+        assert!(legacy.gestures_enabled);
+        assert!(!legacy.gesture_swap_lr);
+    }
+
+    #[test]
+    fn gesture_settings_respect_saved_preferences() {
+        // 配置中的显式开关值优先于默认值。
+        let saved: Settings = serde_json::from_str(
+            r#"{"version":2,"gestures_enabled":false,"gesture_swap_lr":true}"#,
+        )
+        .unwrap();
+
+        assert!(!saved.gestures_enabled);
+        assert!(saved.gesture_swap_lr);
     }
 
     #[test]
