@@ -30,9 +30,9 @@ use crate::hotkey::{self, HotkeySpec};
 use crate::icons::IconWorker;
 use crate::startup;
 use crate::ui::{
-    draw_button, draw_checkbox, draw_gesture_glyph, draw_scrollbar, draw_text,
-    draw_toggle, draw_tooltip, make_font, measure_text, rgb, BtnStyle, CheckState, DibTarget,
-    GestureGlyph, Surface, TextAlign,
+    draw_button, draw_checkbox, draw_gesture_glyph, draw_scrollbar, draw_text, draw_toggle,
+    make_font, measure_text, rgb, BtnStyle, CheckState, DibTarget, GestureGlyph, Surface,
+    TextAlign, TooltipPopup,
 };
 use crate::win32::*;
 
@@ -206,7 +206,7 @@ struct Dlg {
     hover: Hit,
     pressed: Hit,
     tip_pending: Option<(Hit, RECT, String)>,
-    tip_visible: Option<(RECT, String)>,
+    tip_popup: TooltipPopup,
 }
 
 struct Layout {
@@ -893,24 +893,52 @@ impl Dlg {
             .all(|g| self.expanded_folders.contains(&g.id))
     }
 
+    /// 取消待显示的 Tooltip 定时器并立即隐藏悬浮提示窗，避免界面切换或拖动时残留。
+    fn cancel_tooltip(&mut self) {
+        self.tip_pending = None;
+        self.tip_popup.hide();
+        if !self.hwnd.is_invalid() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_TOOLTIP);
+            }
+        }
+    }
+
     fn sync_search_edit_pos(&self) {
         if self.search_edit.is_invalid() {
             return;
         }
         let l = self.layout();
         unsafe {
+            let visible = IsWindowVisible(self.search_edit).as_bool();
             if self.tab == Tab::Folders {
                 let r = l.search_edit_rc;
-                let _ = SetWindowPos(
-                    self.search_edit,
-                    HWND_TOP,
-                    r.left,
-                    r.top,
-                    (r.right - r.left).max(1),
-                    (r.bottom - r.top).max(1),
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOZORDER,
-                );
-            } else {
+                let target_w = (r.right - r.left).max(1);
+                let target_h = (r.bottom - r.top).max(1);
+                let mut cur = RECT::default();
+                let _ = GetWindowRect(self.search_edit, &mut cur);
+                let mut tl = POINT { x: cur.left, y: cur.top };
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut tl);
+                let cur_w = cur.right - cur.left;
+                let cur_h = cur.bottom - cur.top;
+                // 仅当显隐状态或客户区矩形确实变化时才调用 SetWindowPos，避免子窗口无谓重绘闪烁
+                if !visible
+                    || tl.x != r.left
+                    || tl.y != r.top
+                    || cur_w != target_w
+                    || cur_h != target_h
+                {
+                    let _ = SetWindowPos(
+                        self.search_edit,
+                        HWND_TOP,
+                        r.left,
+                        r.top,
+                        target_w,
+                        target_h,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOZORDER,
+                    );
+                }
+            } else if visible {
                 let _ = ShowWindow(self.search_edit, SW_HIDE);
             }
         }
@@ -1339,7 +1367,7 @@ fn open_tab(app: &mut App, initial_tab: Tab) {
             hover: Hit::None,
             pressed: Hit::None,
             tip_pending: None,
-            tip_visible: None,
+            tip_popup: TooltipPopup::default(),
         });
         dlg.rebuild_fonts();
         dlg.rebuild_groups(&*ptr);
@@ -1359,11 +1387,12 @@ fn open_tab(app: &mut App, initial_tab: Tab) {
         let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi);
         let x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - cw) / 2;
         let y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - ch) / 2;
+        // 必须启用 WS_CLIPCHILDREN，防止父窗口重绘 BitBlt 覆盖 search_edit 子窗口导致闪烁
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             w!("WinLaunchpadSettings"),
             w!("WinLaunchpad 设置"),
-            WS_POPUP,
+            WS_POPUP | WS_CLIPCHILDREN,
             x,
             y,
             cw,
@@ -1613,7 +1642,7 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
     if same {
         return;
     }
-    dlg.tip_visible = None;
+    dlg.tip_popup.hide();
     dlg.tip_pending = next;
     unsafe {
         let _ = KillTimer(dlg.hwnd, TIMER_TOOLTIP);
@@ -1759,10 +1788,6 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
 
     // 窗口外框线
     sf.stroke_rrect(&RECT { left: 0, top: 0, right: l.w, bottom: l.h }, 10.0 * s, (1.0 * s).max(1.0), rgb(0xD1D5DB, 1.0));
-
-    if let Some((anchor, tip)) = &dlg.tip_visible {
-        draw_tooltip(&mut sf, dc, dlg.font_tip, anchor, tip, l.w, l.h, s);
-    }
 
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -2772,11 +2797,17 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                // 从添加应用弹窗返回时同步最新的手动条目列表
+                // 从添加应用弹窗返回时同步最新的手动条目列表；失焦时收起悬浮提示
                 if loword(wparam.0) as u32 != WA_INACTIVE {
                     dlg.rebuild_groups(app);
                     let _ = InvalidateRect(hwnd, None, false);
+                } else {
+                    dlg.cancel_tooltip();
                 }
+                LRESULT(0)
+            }
+            WM_MOVE => {
+                dlg.cancel_tooltip();
                 LRESULT(0)
             }
             WM_APP_SCAN => {
@@ -2792,6 +2823,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_APP_SELECT_GESTURES_TAB => {
+                dlg.cancel_tooltip();
                 dlg.tab = Tab::Gestures;
                 dlg.capture_hk = false;
                 dlg.hk_msg = None;
@@ -2800,6 +2832,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_DPICHANGED => {
+                dlg.cancel_tooltip();
                 let new = lparam.0 as *const RECT;
                 let r = *new;
                 let dpi = hiword(wparam.0) as u32;
@@ -2832,8 +2865,8 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if wparam.0 == TIMER_TOOLTIP {
                     let _ = KillTimer(hwnd, TIMER_TOOLTIP);
                     if let Some((_, rc, text)) = &dlg.tip_pending {
-                        dlg.tip_visible = Some((*rc, text.clone()));
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let l = dlg.layout();
+                        dlg.tip_popup.show(hwnd, app.hinst, dlg.font_tip, rc, text, l.w, l.h, dlg.scale);
                     }
                 } else if wparam.0 == TIMER_UPDATE {
                     let (done, restart) = dlg.about.poll(&mut app.available_update);
@@ -2868,11 +2901,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
+                let had_hover = dlg.hover != Hit::None;
                 dlg.hover = Hit::None;
-                dlg.tip_pending = None;
-                dlg.tip_visible = None;
-                let _ = KillTimer(hwnd, TIMER_TOOLTIP);
-                let _ = InvalidateRect(hwnd, None, false);
+                dlg.cancel_tooltip();
+                if had_hover {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
@@ -2881,10 +2915,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
                     if dlg.about.scroll(&l.about, dlg.target.mem_dc, dlg.font_body, pt.x, pt.y, get_wheel_delta(wparam.0)) {
+                        dlg.cancel_tooltip();
                         dlg.hover = dlg.hit_test(&l, pt.x, pt.y);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 } else if dlg.tab == Tab::Folders {
+                    dlg.cancel_tooltip();
                     let l = dlg.layout();
                     let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
@@ -2912,7 +2948,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let x = get_x_lparam(lparam.0);
                 let y = get_y_lparam(lparam.0);
                 let hit = dlg.hit_test(&l, x, y);
-                dlg.tip_visible = None;
+                dlg.cancel_tooltip();
                 if hit == Hit::DragBar {
                     let _ = ReleaseCapture();
                     let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
@@ -3353,8 +3389,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             }
                             about::Action::Check | about::Action::Install => {
                                 // 更新期间清除悬停提示，仅在后台任务存在时轮询。
-                                dlg.tip_pending = None;
-                                let _ = KillTimer(hwnd, TIMER_TOOLTIP);
+                                dlg.cancel_tooltip();
                                 if dlg.about.start(action) {
                                     let _ = SetTimer(hwnd, TIMER_UPDATE, 100, None);
                                 }
@@ -3410,6 +3445,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_DESTROY => {
+                dlg.tip_popup.destroy();
                 let _ = KillTimer(hwnd, TIMER_TOOLTIP);
                 let _ = KillTimer(hwnd, TIMER_UPDATE);
                 app.modal = app.modal.saturating_sub(1);

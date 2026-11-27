@@ -20,7 +20,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::App;
-use crate::ui::{draw_button, draw_text, draw_tooltip, make_font, rgb, BtnStyle, DibTarget, TextAlign};
+use crate::ui::{draw_button, draw_text, make_font, rgb, BtnStyle, DibTarget, TextAlign, TooltipPopup};
 use crate::win32::*;
 
 const TIMER_TOOLTIP: usize = 401;
@@ -69,7 +69,7 @@ struct Dlg {
     hover: Hit,
     pressed: Hit,
     tip_pending: Option<(Hit, RECT, String)>,
-    tip_visible: Option<(RECT, String)>,
+    tip_popup: TooltipPopup,
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
@@ -209,6 +209,16 @@ impl Dlg {
         }
         Hit::None
     }
+
+    fn cancel_tooltip(&mut self) {
+        self.tip_pending = None;
+        self.tip_popup.hide();
+        if !self.hwnd.is_invalid() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_TOOLTIP);
+            }
+        }
+    }
 }
 
 pub fn open_create(app: &mut App) {
@@ -249,7 +259,7 @@ fn open_with_mode(app: &mut App, mode: Mode) {
             hover: Hit::None,
             pressed: Hit::None,
             tip_pending: None,
-            tip_visible: None,
+            tip_popup: TooltipPopup::default(),
         });
         dlg.rebuild_fonts();
 
@@ -348,7 +358,7 @@ fn update_tip(dlg: &mut Dlg, l: &DialogLayout, hit: Hit) {
     if same {
         return;
     }
-    dlg.tip_visible = None;
+    dlg.tip_popup.hide();
     dlg.tip_pending = next;
     unsafe {
         let _ = KillTimer(dlg.hwnd, TIMER_TOOLTIP);
@@ -453,10 +463,6 @@ fn paint_dlg(dlg: &mut Dlg) {
         (1.0 * s).max(1.0),
         rgb(0xD1D5DB, 1.0),
     );
-
-    if let Some((anchor, tip)) = &dlg.tip_visible {
-        draw_tooltip(&mut sf, dc, dlg.font_tip, anchor, tip, l.w, l.h, s);
-    }
 
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -583,9 +589,17 @@ fn handle(
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                if loword(wparam.0) as u32 != WA_INACTIVE && !dlg.edit.is_invalid() {
-                    let _ = SetFocus(dlg.edit);
+                if loword(wparam.0) as u32 != WA_INACTIVE {
+                    if !dlg.edit.is_invalid() {
+                        let _ = SetFocus(dlg.edit);
+                    }
+                } else {
+                    dlg.cancel_tooltip();
                 }
+                LRESULT(0)
+            }
+            WM_MOVE => {
+                dlg.cancel_tooltip();
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -609,6 +623,7 @@ fn handle(
                 LRESULT(0)
             }
             WM_DPICHANGED => {
+                dlg.cancel_tooltip();
                 let new = lparam.0 as *const RECT;
                 let r = *new;
                 let dpi = hiword(wparam.0) as u32;
@@ -631,8 +646,8 @@ fn handle(
                 if wparam.0 == TIMER_TOOLTIP {
                     let _ = KillTimer(hwnd, TIMER_TOOLTIP);
                     if let Some((_, rc, text)) = &dlg.tip_pending {
-                        dlg.tip_visible = Some((*rc, text.clone()));
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let l = dlg.layout();
+                        dlg.tip_popup.show(hwnd, app.hinst, dlg.font_tip, rc, text, l.w, l.h, dlg.scale);
                     }
                 }
                 LRESULT(0)
@@ -656,17 +671,18 @@ fn handle(
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
+                let had_hover = dlg.hover != Hit::None;
                 dlg.hover = Hit::None;
-                dlg.tip_pending = None;
-                dlg.tip_visible = None;
-                let _ = KillTimer(hwnd, TIMER_TOOLTIP);
-                let _ = InvalidateRect(hwnd, None, false);
+                dlg.cancel_tooltip();
+                if had_hover {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
                 let l = dlg.layout();
                 let hit = dlg.hit_test(&l, get_x_lparam(lparam.0), get_y_lparam(lparam.0));
-                dlg.tip_visible = None;
+                dlg.cancel_tooltip();
                 if hit == Hit::DragBar {
                     let _ = ReleaseCapture();
                     let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
@@ -717,6 +733,7 @@ fn handle(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                dlg.tip_popup.destroy();
                 let _ = KillTimer(hwnd, TIMER_TOOLTIP);
                 app.modal = app.modal.saturating_sub(1);
                 app.folder_hwnd = HWND::default();

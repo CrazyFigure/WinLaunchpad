@@ -3,8 +3,10 @@
 //! 统一封装圆角矩形、抗锯齿圆/线、图标 Lanczos3 高清重采样、文字阴影与测量、
 //! 现代复选框/开关/按钮/滚动条、矢量手势轨迹、火箭徽标与 100ms Tooltip 浮层。
 
+use std::sync::OnceLock;
+
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
 };
@@ -24,9 +26,16 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
-    GdiFlush, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, HDC, HFONT, HGDIOBJ, TRANSPARENT,
+    ClientToScreen, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
+    DrawTextW, GdiFlush, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    DRAW_TEXT_FORMAT, HBRUSH, HDC, HFONT, HGDIOBJ, TRANSPARENT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, RegisterClassExW, SetWindowPos,
+    ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, ULW_ALPHA, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 pub type Rgba = (f32, f32, f32, f32);
@@ -440,8 +449,39 @@ impl Surface {
         (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
     }
 
+    /// 将浮点 RGBA 颜色转换为预乘 BGRA 并执行 Porter-Duff OVER 合成。
+    #[inline]
+    fn blend_premul_rgba(&mut self, x: i32, y: i32, c: Rgba) {
+        let a = (c.3.clamp(0.0, 1.0) * 255.0).round() as u32;
+        if a == 0 {
+            return;
+        }
+        let r = ((c.0.clamp(0.0, 1.0) * a as f32).round() as u32).min(a);
+        let g = ((c.1.clamp(0.0, 1.0) * a as f32).round() as u32).min(a);
+        let b = ((c.2.clamp(0.0, 1.0) * a as f32).round() as u32).min(a);
+        self.blend_premul_over(x, y, b, g, r, a);
+    }
+
+    #[inline]
+    fn blend_pixel(&mut self, x: i32, y: i32, c: Rgba, premul: bool) {
+        if premul {
+            self.blend_premul_rgba(x, y, c);
+        } else {
+            self.blend(x, y, c);
+        }
+    }
+
     /// 填充抗锯齿圆角矩形（中间核心矩形走高速填充，仅对边缘/四角做 SDF 抗锯齿）。
     pub fn fill_rrect(&mut self, r: &RECT, radius: f32, c: Rgba) {
+        self.fill_rrect_impl(r, radius, c, false);
+    }
+
+    /// 在透明分层窗口表面上以预乘 Alpha 填充抗锯齿圆角矩形。
+    pub fn fill_rrect_premul(&mut self, r: &RECT, radius: f32, c: Rgba) {
+        self.fill_rrect_impl(r, radius, c, true);
+    }
+
+    fn fill_rrect_impl(&mut self, r: &RECT, radius: f32, c: Rgba, premul: bool) {
         if c.3 <= 0.001 || r.right <= r.left || r.bottom <= r.top {
             return;
         }
@@ -449,7 +489,16 @@ impl Surface {
         let max_r = ((rr - l).min(b - t) * 0.5).max(0.0);
         let radius = radius.min(max_r);
         if radius <= 0.5 {
-            self.fill_rect(r, c);
+            if !premul {
+                self.fill_rect(r, c);
+            } else {
+                let (x0, y0, x1, y1) = self.clamp_bounds(r.left, r.top, r.right, r.bottom);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        self.blend_premul_rgba(x, y, c);
+                    }
+                }
+            }
             return;
         }
         let pad = radius.ceil() as i32 + 1;
@@ -466,7 +515,16 @@ impl Surface {
                 right: r.right - 1,
                 bottom: inner_bot,
             };
-            self.fill_rect(&core, c);
+            if !premul {
+                self.fill_rect(&core, c);
+            } else {
+                let (cx0, cy0, cx1, cy1) = self.clamp_bounds(core.left, core.top, core.right, core.bottom);
+                for y in cy0..cy1 {
+                    for x in cx0..cx1 {
+                        self.blend_premul_rgba(x, y, c);
+                    }
+                }
+            }
         }
 
         let (x0, y0, x1, y1) = self.clamp_bounds(r.left - 1, r.top - 1, r.right + 1, r.bottom + 1);
@@ -479,13 +537,22 @@ impl Surface {
                 let d = Self::sd_rrect(x as f32 + 0.5, y as f32 + 0.5, l, t, rr, b, radius);
                 if d < 0.5 {
                     let cov = (0.5 - d).clamp(0.0, 1.0);
-                    self.blend(x, y, (c.0, c.1, c.2, c.3 * cov));
+                    self.blend_pixel(x, y, (c.0, c.1, c.2, c.3 * cov), premul);
                 }
             }
         }
     }
 
     pub fn stroke_rrect(&mut self, r: &RECT, radius: f32, width: f32, c: Rgba) {
+        self.stroke_rrect_impl(r, radius, width, c, false);
+    }
+
+    /// 在透明分层窗口表面上以预乘 Alpha 绘制抗锯齿圆角边框。
+    pub fn stroke_rrect_premul(&mut self, r: &RECT, radius: f32, width: f32, c: Rgba) {
+        self.stroke_rrect_impl(r, radius, width, c, true);
+    }
+
+    fn stroke_rrect_impl(&mut self, r: &RECT, radius: f32, width: f32, c: Rgba, premul: bool) {
         if c.3 <= 0.001 || r.right <= r.left || r.bottom <= r.top {
             return;
         }
@@ -517,7 +584,7 @@ impl Surface {
                 let d = Self::sd_rrect(x as f32 + 0.5, y as f32 + 0.5, l, t, rr, b, rad).abs();
                 if d < half + 0.5 {
                     let cov = (half + 0.5 - d).clamp(0.0, 1.0);
-                    self.blend(x, y, (c.0, c.1, c.2, c.3 * cov));
+                    self.blend_pixel(x, y, (c.0, c.1, c.2, c.3 * cov), premul);
                 }
             }
         }
@@ -1621,9 +1688,35 @@ pub fn draw_scrollbar(
     surface.fill_rrect(&r, w * 0.5, c);
 }
 
-/// 绘制自定义圆角深色磨砂 Tooltip（自动约束在窗口边界内，替代原生 title）。
-pub fn draw_tooltip(
-    surface: &mut Surface,
+#[derive(Clone, Copy)]
+struct TooltipLayout {
+    rect: RECT,
+    shadow_rect: RECT,
+    text_rc: RECT,
+    radius: f32,
+    border_w: f32,
+}
+
+impl TooltipLayout {
+    fn offset(&self, dx: i32, dy: i32) -> Self {
+        let shift = |r: RECT| RECT {
+            left: r.left + dx,
+            top: r.top + dy,
+            right: r.right + dx,
+            bottom: r.bottom + dy,
+        };
+        Self {
+            rect: shift(self.rect),
+            shadow_rect: shift(self.shadow_rect),
+            text_rc: shift(self.text_rc),
+            radius: self.radius,
+            border_w: self.border_w,
+        }
+    }
+}
+
+/// 计算 Tooltip 的气泡、阴影与文本矩形布局，自动约束在宿主窗口边界内。
+fn compute_tooltip_layout(
     dc: HDC,
     font: HFONT,
     anchor: &RECT,
@@ -1631,9 +1724,9 @@ pub fn draw_tooltip(
     bounds_w: i32,
     bounds_h: i32,
     scale: f32,
-) {
-    if text.is_empty() {
-        return;
+) -> Option<TooltipLayout> {
+    if text.is_empty() || bounds_w <= 0 || bounds_h <= 0 {
+        return None;
     }
     let (tw, th) = measure_text(dc, text, font);
     let pad_x = (10.0 * scale).round() as i32;
@@ -1667,17 +1760,255 @@ pub fn draw_tooltip(
         right: rect.right,
         bottom: rect.bottom + (3.0 * scale).round() as i32,
     };
-    surface.fill_rrect(&shadow_rect, 7.0 * scale, (0.0, 0.0, 0.0, 0.25));
-    surface.fill_rrect(&rect, 7.0 * scale, rgb(0x181C24, 0.94));
-    surface.stroke_rrect(&rect, 7.0 * scale, (1.0 * scale).max(1.0), (1.0, 1.0, 1.0, 0.16));
-
     let text_rc = RECT {
         left: rect.left + pad_x,
         top: rect.top,
         right: rect.right - pad_x,
         bottom: rect.bottom,
     };
-    draw_text(dc, text, font, &text_rc, rgb(0xF8FAFC, 0.98), TextAlign::Center, true, false);
+    Some(TooltipLayout {
+        rect,
+        shadow_rect,
+        text_rc,
+        radius: 7.0 * scale,
+        border_w: (1.0 * scale).max(1.0),
+    })
+}
+
+/// 绘制自定义圆角深色磨砂 Tooltip（自动约束在窗口边界内，替代原生 title）。
+pub fn draw_tooltip(
+    surface: &mut Surface,
+    dc: HDC,
+    font: HFONT,
+    anchor: &RECT,
+    text: &str,
+    bounds_w: i32,
+    bounds_h: i32,
+    scale: f32,
+) {
+    let Some(tl) = compute_tooltip_layout(dc, font, anchor, text, bounds_w, bounds_h, scale) else {
+        return;
+    };
+    surface.fill_rrect(&tl.shadow_rect, tl.radius, (0.0, 0.0, 0.0, 0.25));
+    surface.fill_rrect(&tl.rect, tl.radius, rgb(0x181C24, 0.94));
+    surface.stroke_rrect(&tl.rect, tl.radius, tl.border_w, (1.0, 1.0, 1.0, 0.16));
+    draw_text(dc, text, font, &tl.text_rc, rgb(0xF8FAFC, 0.98), TextAlign::Center, true, false);
+}
+
+/// 将 Tooltip 按预乘 Alpha 渲染到透明分层表面（用于独立悬浮窗，不被原生子控件遮挡）。
+fn render_tooltip_surface(
+    surface: &mut Surface,
+    text_scratch: &mut DibTarget,
+    font: HFONT,
+    text: &str,
+    tl: &TooltipLayout,
+    scale: f32,
+) {
+    surface.fill_rrect_premul(&tl.shadow_rect, tl.radius, (0.0, 0.0, 0.0, 0.25));
+    surface.fill_rrect_premul(&tl.rect, tl.radius, rgb(0x181C24, 0.94));
+    surface.stroke_rrect_premul(&tl.rect, tl.radius, tl.border_w, (1.0, 1.0, 1.0, 0.16));
+    draw_transparent_text_ex(
+        surface,
+        text_scratch,
+        text,
+        font,
+        &tl.text_rc,
+        rgb(0xF8FAFC, 0.98),
+        TextAlign::Center,
+        false,
+        scale,
+    );
+}
+
+unsafe extern "system" fn tooltip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 独立透明分层 Tooltip 浮窗：始终悬浮于宿主窗口及其原生子控件（如 EDIT 输入框）之上，
+/// 且显隐无需重绘宿主窗口，从而消除控件遮挡与输入框闪烁问题。
+#[derive(Default)]
+pub struct TooltipPopup {
+    hwnd: HWND,
+    target: DibTarget,
+    text_scratch: DibTarget,
+    visible: bool,
+}
+
+impl TooltipPopup {
+    fn ensure_window(&mut self, owner: HWND, hinst: HINSTANCE) -> bool {
+        if !self.hwnd.is_invalid() && unsafe { IsWindow(self.hwnd).as_bool() } {
+            return true;
+        }
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| unsafe {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(tooltip_wnd_proc),
+                hInstance: hinst,
+                hbrBackground: HBRUSH::default(),
+                lpszClassName: w!("WinLaunchpadTooltip"),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+        });
+        unsafe {
+            self.hwnd = CreateWindowExW(
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_LAYERED,
+                w!("WinLaunchpadTooltip"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                owner,
+                None,
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+        }
+        !self.hwnd.is_invalid()
+    }
+
+    /// 根据宿主窗口客户区坐标的 `anchor` 与尺寸约束，定位并显示悬浮 Tooltip。
+    pub fn show(
+        &mut self,
+        owner: HWND,
+        hinst: HINSTANCE,
+        font: HFONT,
+        anchor: &RECT,
+        text: &str,
+        bounds_w: i32,
+        bounds_h: i32,
+        scale: f32,
+    ) {
+        if text.is_empty() || owner.is_invalid() || bounds_w <= 0 || bounds_h <= 0 {
+            self.hide();
+            return;
+        }
+        if !self.ensure_window(owner, hinst) {
+            return;
+        }
+        if !self.text_scratch.ensure_at_least(16, 16) {
+            return;
+        }
+        let Some(measure_dc) = self.text_scratch.mem_dc else {
+            return;
+        };
+        let Some(tl) = compute_tooltip_layout(measure_dc, font, anchor, text, bounds_w, bounds_h, scale) else {
+            self.hide();
+            return;
+        };
+
+        // 预留 2px 抗锯齿边界，确保圆角与外阴影平滑不裁边
+        let edge_pad = 2;
+        let box_l = tl.rect.left.min(tl.shadow_rect.left) - edge_pad;
+        let box_t = tl.rect.top.min(tl.shadow_rect.top) - edge_pad;
+        let box_r = tl.rect.right.max(tl.shadow_rect.right) + edge_pad;
+        let box_b = tl.rect.bottom.max(tl.shadow_rect.bottom) + edge_pad;
+        let win_w = (box_r - box_l).max(1);
+        let win_h = (box_b - box_t).max(1);
+        let local_tl = tl.offset(-box_l, -box_t);
+
+        if !self.target.ensure_at_least(win_w, win_h) {
+            return;
+        }
+        let Some(dc) = self.target.mem_dc else {
+            return;
+        };
+        {
+            let Some(mut sf) = self.target.surface() else {
+                return;
+            };
+            sf.clear_rect_transparent(win_w, win_h);
+            sf.set_clip(Some(RECT {
+                left: 0,
+                top: 0,
+                right: win_w,
+                bottom: win_h,
+            }));
+            render_tooltip_surface(&mut sf, &mut self.text_scratch, font, text, &local_tl, scale);
+        }
+
+        unsafe {
+            let mut dst_pt = POINT { x: box_l, y: box_t };
+            let _ = ClientToScreen(owner, &mut dst_pt);
+            let dst_sz = SIZE { cx: win_w, cy: win_h };
+            let src_pt = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&dst_pt),
+                Some(&dst_sz),
+                dc,
+                Some(&src_pt),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            if !self.visible {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                self.visible = true;
+            }
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 隐藏浮窗并释放临时 DIB 缓冲以控制内存占用。
+    pub fn hide(&mut self) {
+        if self.visible && !self.hwnd.is_invalid() {
+            unsafe {
+                if IsWindow(self.hwnd).as_bool() {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            self.visible = false;
+        }
+        self.target.release();
+        self.text_scratch.release();
+    }
+
+    /// 销毁浮窗窗口句柄与相关 GDI 资源。
+    pub fn destroy(&mut self) {
+        self.hide();
+        unsafe {
+            if !self.hwnd.is_invalid() && IsWindow(self.hwnd).as_bool() {
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+        self.hwnd = HWND::default();
+    }
+}
+
+impl Drop for TooltipPopup {
+    fn drop(&mut self) {
+        self.destroy();
+    }
 }
 
 /// 绘制软件自身图标徽标（复刻 assets/app.ico：45° 紫蓝渐变圆角方框 + 3×3 白色网格方块）。
@@ -1887,6 +2218,21 @@ pub fn draw_transparent_text(
     col: Rgba,
     scale: f32,
 ) {
+    draw_transparent_text_ex(surface, scratch, text, font, rect, col, TextAlign::Left, true, scale);
+}
+
+/// 将 GDI 文字按指定对齐方式与可选微阴影合成到透明分层表面。
+fn draw_transparent_text_ex(
+    surface: &mut Surface,
+    scratch: &mut DibTarget,
+    text: &str,
+    font: HFONT,
+    rect: &RECT,
+    col: Rgba,
+    align: TextAlign,
+    shadow: bool,
+    scale: f32,
+) {
     if text.is_empty() {
         return;
     }
@@ -1905,7 +2251,10 @@ pub fn draw_transparent_text(
         right: tw,
         bottom: th,
     };
-    draw_text(sdc, text, font, &local_rc, rgb(0xFFFFFF, 1.0), TextAlign::Left, true, false);
+    draw_text(sdc, text, font, &local_rc, rgb(0xFFFFFF, 1.0), align, true, false);
+    unsafe {
+        let _ = GdiFlush();
+    }
     if scratch.ptr.is_null() {
         return;
     }
@@ -1919,14 +2268,16 @@ pub fn draw_transparent_text(
     let cb_f = col.2.clamp(0.0, 1.0);
     let ca_f = col.3.clamp(0.0, 1.0);
 
-    // 先叠加轻微下沉投影，确保在极暗或极亮壁纸上都能锐利识别
-    for ly in 0..th {
-        let row = ly as usize * src_stride;
-        for lx in 0..tw {
-            let mask = (src_slice[row + lx as usize] >> 8) & 0xFF;
-            if mask > 12 {
-                let sa = (mask * 72) >> 8;
-                surface.blend_premul_over(rect.left + lx, rect.top + ly + sdy, 0, 0, 0, sa);
+    // 可选叠加轻微下沉投影，确保在极暗或极亮壁纸上都能锐利识别
+    if shadow {
+        for ly in 0..th {
+            let row = ly as usize * src_stride;
+            for lx in 0..tw {
+                let mask = (src_slice[row + lx as usize] >> 8) & 0xFF;
+                if mask > 12 {
+                    let sa = (mask * 72) >> 8;
+                    surface.blend_premul_over(rect.left + lx, rect.top + ly + sdy, 0, 0, 0, sa);
+                }
             }
         }
     }
@@ -2178,5 +2529,71 @@ mod tests {
             }
         }
         assert!(is_card_shape(&folder, sz as usize, sz as usize).is_none());
+    }
+
+    #[test]
+    fn tooltip_surface_produces_valid_premultiplied_alpha() {
+        let mut text_scratch = DibTarget::default();
+        assert!(text_scratch.ensure(240, 64));
+        let dc = text_scratch.mem_dc.expect("测试 DIB DC 应已创建");
+        let font = make_font(12, 400);
+        let anchor = RECT { left: 420, top: 120, right: 780, bottom: 156 };
+        let tl = compute_tooltip_layout(
+            dc,
+            font,
+            &anchor,
+            r"Winc · C:\Users\demo\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Winc.lnk",
+            820,
+            560,
+            1.0,
+        )
+        .expect("应成功计算 Tooltip 布局");
+        // 长路径居中时在宿主边界内保持有效宽高
+        assert!(tl.rect.left >= 8 && tl.rect.right <= 812);
+        assert!(tl.rect.bottom <= anchor.top);
+
+        let edge_pad = 2;
+        let box_l = tl.rect.left.min(tl.shadow_rect.left) - edge_pad;
+        let box_t = tl.rect.top.min(tl.shadow_rect.top) - edge_pad;
+        let box_r = tl.rect.right.max(tl.shadow_rect.right) + edge_pad;
+        let box_b = tl.rect.bottom.max(tl.shadow_rect.bottom) + edge_pad;
+        let win_w = (box_r - box_l) as usize;
+        let win_h = (box_b - box_t) as usize;
+        let local_tl = tl.offset(-box_l, -box_t);
+
+        let mut buf = vec![0u32; win_w * win_h];
+        let mut sf = Surface {
+            w: win_w,
+            h: win_h,
+            ptr: buf.as_mut_ptr(),
+            clip: None,
+        };
+        render_tooltip_surface(
+            &mut sf,
+            &mut text_scratch,
+            font,
+            r"Winc · C:\Users\demo\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Winc.lnk",
+            &local_tl,
+            1.0,
+        );
+
+        let mut bright_text_pixels = 0usize;
+        for &px in &buf {
+            let a = (px >> 24) & 0xFF;
+            let r = (px >> 16) & 0xFF;
+            let g = (px >> 8) & 0xFF;
+            let b = px & 0xFF;
+            assert!(r <= a && g <= a && b <= a, "premultiplied invariant violated: {px:#010X}");
+            if a > 220 && r > 180 && g > 180 && b > 180 {
+                bright_text_pixels += 1;
+            }
+        }
+        assert!(bright_text_pixels > 30, "应渲染出清晰的浅色文字像素，实际: {bright_text_pixels}");
+        // 外边缘角点保持全透明
+        assert_eq!(buf[0], 0);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        text_scratch.release();
     }
 }
