@@ -2078,7 +2078,7 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
                 let icx = row.left as f32 + 12.0 * s + isz * 0.5;
                 let icy = (row.top + row.bottom) as f32 * 0.5;
                 if let Some(icon) = app.cached_icon(&item.entry.icon_key) {
-                    sf.draw_icon_bilinear(&icon, icx, icy, isz, false, 0.0);
+                    sf.draw_icon_resampled(&icon, icx, icy, isz);
                 } else {
                     let half = isz * 0.5;
                     sf.fill_rrect(&RECT { left: (icx - half) as i32, top: (icy - half) as i32, right: (icx + half) as i32, bottom: (icy + half) as i32 }, 6.0 * s, rgb(0xFEE2E2, 1.0));
@@ -2169,7 +2169,7 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
                 let icx = icon_left as f32 + isz * 0.5;
                 let icy = (row.top + row.bottom) as f32 * 0.5;
                 if let Some(icon) = app.cached_icon(&item.entry.icon_key) {
-                    sf.draw_icon_bilinear(&icon, icx, icy, isz, false, 0.0);
+                    sf.draw_icon_resampled(&icon, icx, icy, isz);
                 } else {
                     let half = isz * 0.5;
                     sf.fill_rrect(
@@ -2319,7 +2319,7 @@ fn paint_tab_folders(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
                         let icx = icon_left as f32 + isz * 0.5;
                         let icy = (row.top + row.bottom) as f32 * 0.5;
                         if let Some(icon) = app.cached_icon(&e.icon_key) {
-                            sf.draw_icon_bilinear(&icon, icx, icy, isz, false, 0.0);
+                            sf.draw_icon_resampled(&icon, icx, icy, isz);
                         } else {
                             let half = isz * 0.5;
                             sf.fill_rrect(&RECT { left: (icx - half) as i32, top: (icy - half) as i32, right: (icx + half) as i32, bottom: (icy + half) as i32 }, 5.0 * s, rgb(0xE2E8F0, 1.0));
@@ -2691,7 +2691,7 @@ fn delete_expired_indices(dlg: &mut Dlg, app: &mut App, indices: Vec<usize>) {
             for ent in rd.flatten() {
                 let p = ent.path();
                 if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    if name.ends_with(".icache") && !name.starts_with("v4_") {
+                    if name.ends_with(".icache") && !name.starts_with("v5_") {
                         let _ = std::fs::remove_file(&p);
                     }
                 }

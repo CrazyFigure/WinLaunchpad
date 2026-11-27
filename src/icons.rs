@@ -25,7 +25,9 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::win32::{exe_path, fnv1a64, wide};
 
 pub const WM_APP_ICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
-const ICON_CACHE_MAGIC: &[u8; 4] = b"WLI4";
+/// 统一落盘高清主图标尺寸，保证高分屏与全部图标大小档位下均采用高质量降采样。
+pub const MASTER_ICON_SIZE: u32 = 192;
+const ICON_CACHE_MAGIC: &[u8; 4] = b"WLI5";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub type IconKey = (String, u32);
@@ -69,36 +71,26 @@ impl IconWorker {
         Arc::new(IconWorker { queue, cache_dir })
     }
 
-    /// 归一化缓存尺寸档位，兼顾高分屏锐利度与内存控制。
-    pub fn bucket_size(size: u32) -> u32 {
-        if size <= 64 {
-            64
-        } else if size <= 96 {
-            96
-        } else if size <= 128 {
-            128
-        } else {
-            160
-        }
+    /// 统一返回高清主图标尺寸档位（192px），兼顾高分屏锐利度与任意尺寸降采样质量。
+    pub fn bucket_size(_size: u32) -> u32 {
+        MASTER_ICON_SIZE
     }
 
-    /// 计算磁盘缓存路径（v4 去外圈淡投影与动态圆角基础格式）。
-    pub fn cache_path(cache_dir: &Path, key: &str, size: u32) -> PathBuf {
-        let bucket = Self::bucket_size(size);
-        let sig = format!("v4|{}|{}", key.to_lowercase(), bucket);
+    /// 计算磁盘缓存路径（v5 统一 192px Lanczos3 主图格式）。
+    pub fn cache_path(cache_dir: &Path, key: &str, _size: u32) -> PathBuf {
+        let sig = format!("v5|{}|{}", key.to_lowercase(), MASTER_ICON_SIZE);
         let h = fnv1a64(sig.as_bytes());
-        cache_dir.join(format!("v4_{h:016x}_{bucket}.icache"))
+        cache_dir.join(format!("v5_{h:016x}.icache"))
     }
 
-    /// 删除指定 `icon_key` 在磁盘缓存中的全部尺寸条目。
+    /// 删除指定 `icon_key` 在磁盘缓存中的全部版本与尺寸条目。
     pub fn remove_disk_cache_for_key(cache_dir: &Path, key: &str) {
         if key.is_empty() {
             return;
         }
+        let _ = std::fs::remove_file(Self::cache_path(cache_dir, key, MASTER_ICON_SIZE));
         for bucket in [64u32, 96, 128, 160] {
-            let p = Self::cache_path(cache_dir, key, bucket);
-            let _ = std::fs::remove_file(p);
-            for prefix in ["v3_", "v2_", ""] {
+            for prefix in ["v4_", "v3_", "v2_", ""] {
                 let sig = if prefix.is_empty() {
                     format!("{}|{}", key.to_lowercase(), bucket)
                 } else {
@@ -110,24 +102,13 @@ impl IconWorker {
         }
     }
 
-    /// 返回指定 `icon_key` 当前最早的磁盘缓存修改时间（用于对比程序源文件是否已更新）。
+    /// 返回指定 `icon_key` 当前磁盘缓存的修改时间（用于对比程序源文件是否已更新）。
     pub fn disk_cache_mtime(cache_dir: &Path, key: &str) -> Option<std::time::SystemTime> {
         if key.is_empty() {
             return None;
         }
-        let mut oldest: Option<std::time::SystemTime> = None;
-        for bucket in [64u32, 96, 128, 160] {
-            let p = Self::cache_path(cache_dir, key, bucket);
-            if let Ok(meta) = std::fs::metadata(&p) {
-                if let Ok(mtime) = meta.modified() {
-                    oldest = Some(match oldest {
-                        Some(prev) => prev.min(mtime),
-                        None => mtime,
-                    });
-                }
-            }
-        }
-        oldest
+        let p = Self::cache_path(cache_dir, key, MASTER_ICON_SIZE);
+        std::fs::metadata(&p).ok()?.modified().ok()
     }
 
     /// 清空磁盘图标缓存目录下的全部 `.icache` 文件。
@@ -214,8 +195,21 @@ fn post_icon(hwnd: HWND, key: String, size: u32, extracted: Option<(Vec<u8>, u32
     }
 }
 
+/// 清理历史旧版本（v4 及更早）遗留 `.icache` 文件，避免升级后占用额外磁盘空间。
+fn cleanup_legacy_cache(cache_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(cache_dir) else { return };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+        if name.ends_with(".icache") && !name.starts_with("v5_") {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 fn icon_thread(queue: Arc<(Mutex<Queue>, Condvar)>, hwnd_raw: isize, cache_dir: PathBuf) {
     let hwnd = HWND(hwnd_raw as *mut _);
+    cleanup_legacy_cache(&cache_dir);
     loop {
         let mut batch: Vec<IconKey> = Vec::new();
         {
@@ -334,9 +328,9 @@ pub fn worker_extract_from_file(req_path: &Path) {
 }
 
 /// 返回 (归一化预乘 BGRA 像素, 宽, 高)。仅在工作进程中调用。
-pub fn extract(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let target = size.clamp(32, 192);
-    let raw = extract_item(key, target).or_else(|| {
+/// 始终向 Windows Shell 请求最高清 256×256 原图，再经 Lanczos3 降采样至 192×192 主图落盘。
+pub fn extract(key: &str, _size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let raw = extract_item(key, 256).or_else(|| {
         if Path::new(key)
             .extension()
             .map(|e| e.eq_ignore_ascii_case("lnk"))
@@ -344,13 +338,13 @@ pub fn extract(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
         {
             if let Some(info) = crate::catalog::read_lnk(Path::new(key)) {
                 if !info.target.is_empty() && Path::new(&info.target).exists() {
-                    return extract_item(&info.target, target);
+                    return extract_item(&info.target, 256);
                 }
             }
         }
         None
     })?;
-    Some(normalize_and_premultiply(raw.0, raw.1, raw.2, target))
+    Some(normalize_and_premultiply(raw.0, raw.1, raw.2, MASTER_ICON_SIZE))
 }
 
 fn extract_item(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
@@ -421,9 +415,9 @@ fn extract_item(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 /// 图标内容边界归一化：
-/// 1. 裁剪多余透明留白，消除部分图标过小的问题；
-/// 2. 识别尖角矩形图标及外圈白边，裁切为统一的 macOS 风格圆角；
-/// 3. 双线性缩放到目标尺寸并完成 alpha 预乘。
+/// 1. 裁剪多余透明留白与淡阴影，消除部分图标过小的问题；
+/// 2. 识别四边满角矩形图标及外圈白边，保留对称圆角基础轮廓并保护文件夹/圆形/异形图标；
+/// 3. 先将源图预乘 Alpha 再执行 Lanczos3 高清重采样，彻底杜绝边缘暗边与外延突起。
 fn normalize_and_premultiply(
     px: Vec<u8>,
     w: u32,
@@ -437,7 +431,7 @@ fn normalize_and_premultiply(
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
     };
 
-    // 1. 优先以核心不透明像素（alpha >= 170）定位图形边界，裁掉微信输入法等原图外圈淡透明投影，避免视觉缩水
+    // 1. 优先以核心不透明像素（alpha >= 170）定位图形边界，裁掉外圈淡透明投影，避免视觉缩水
     let (mut cmin_x, mut cmin_y, mut cmax_x, mut cmax_y) = (iw, ih, -1i32, -1i32);
     let (mut lmin_x, mut lmin_y, mut lmax_x, mut lmax_y) = (iw, ih, -1i32, -1i32);
     for y in 0..ih {
@@ -471,7 +465,7 @@ fn normalize_and_premultiply(
         (0, 0, iw - 1, ih - 1)
     };
 
-    // 2. 检测是否带尖角矩形底板（四个内角均不透明），若是则平滑圆角化并微缩至 84% 保持视觉等大
+    // 2. 严格要求四角均不透明才判定为尖角矩形底板，避免误伤只有三角的资源管理器文件夹图标
     let cw = (max_x - min_x + 1).max(1);
     let ch = (max_y - min_y + 1).max(1);
     let inset_c = (cw.min(ch) / 24).max(1);
@@ -482,7 +476,7 @@ fn normalize_and_premultiply(
         at(max_x - inset_c, max_y - inset_c)[3] > 200,
     ];
     let sharp_count = sharp_corners.iter().filter(|&&b| b).count();
-    let is_sharp_rect = sharp_count >= 3;
+    let is_sharp_rect = sharp_count == 4;
 
     // 3. 若是带 1-2px 纯白外框的方图标且内部非白，轻微收边消除多余白边
     if is_sharp_rect && cw > 24 && ch > 24 {
@@ -511,7 +505,7 @@ fn normalize_and_premultiply(
     let ch_i = (max_y - min_y + 1).max(1);
     let cw = cw_i as f32;
     let ch = ch_i as f32;
-    // 判断是否已经是圆角方形（中心边缘不透明但角落透明）
+    // 判断是否贴边实体图形（如圆形或已圆角方卡）
     let edge_opaque = at(min_x + cw_i / 2, min_y + 2)[3] > 200
         && at(min_x + 2, min_y + ch_i / 2)[3] > 200;
 
@@ -544,9 +538,19 @@ fn normalize_and_premultiply(
     let needs_light_card =
         !is_sharp_rect && trans_ratio > 0.28 && avg_luma < 0.28 && bright_ratio < 0.14;
 
+    // 4. 先预乘 Alpha，再调用自适应 Lanczos3 重采样，防止透明边界出现黑边色渗
+    let mut premul = vec![0u8; px.len()];
+    for (dst, src) in premul.chunks_exact_mut(4).zip(px.chunks_exact(4)) {
+        let a = src[3] as u32;
+        dst[0] = ((src[0] as u32 * a + 127) / 255) as u8;
+        dst[1] = ((src[1] as u32 * a + 127) / 255) as u8;
+        dst[2] = ((src[2] as u32 * a + 127) / 255) as u8;
+        dst[3] = a as u8;
+    }
+
     let mut out = vec![0u8; (target * target * 4) as usize];
     if needs_light_card {
-        // 为纯暗色透明图标自动铺设 macOS 风格浅银白圆角卡片，居中嵌放原始图标
+        // 为纯暗色透明图标自动铺设 macOS 风格浅银白圆角卡片，居中嵌放高清 Lanczos3 前景图标
         let card_sz = (target as f32 * 0.85).round().max(16.0);
         let card_x0 = (target as f32 - card_sz) * 0.5;
         let card_y0 = (target as f32 - card_sz) * 0.5;
@@ -559,10 +563,22 @@ fn normalize_and_premultiply(
 
         let inner_fit = card_sz * 0.62;
         let iscale = (inner_fit / cw).min(inner_fit / ch);
-        let dw = (cw * iscale).round().max(1.0);
-        let dh = (ch * iscale).round().max(1.0);
-        let dx0 = (target as f32 - dw) * 0.5;
-        let dy0 = (target as f32 - dh) * 0.5;
+        let dw_i = (cw * iscale).round().max(1.0) as i32;
+        let dh_i = (ch * iscale).round().max(1.0) as i32;
+        let fg = crate::ui::resample_premul_bgra(
+            &premul,
+            iw,
+            ih,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            dw_i,
+            dh_i,
+            false,
+        );
+        let dx0 = ((target as i32 - dw_i) as f32 * 0.5).round() as i32;
+        let dy0 = ((target as i32 - dh_i) as f32 * 0.5).round() as i32;
 
         for y in 0..target as i32 {
             let fy = y as f32 + 0.5;
@@ -583,42 +599,31 @@ fn normalize_and_premultiply(
                 }
 
                 // 卡片边缘微弱高光，增加层次感
-                let rim = if sd > -1.3 && sd < 0.2 { 1.0 - ((sd + 0.55).abs() / 0.85).clamp(0.0, 1.0) } else { 0.0 };
+                let rim = if sd > -1.3 && sd < 0.2 {
+                    1.0 - ((sd + 0.55).abs() / 0.85).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 let mut r = base_r + (255.0 - base_r) * rim * 0.45;
                 let mut g = base_g + (255.0 - base_g) * rim * 0.45;
                 let mut b = base_b + (255.0 - base_b) * rim * 0.45;
 
-                if fx >= dx0 - 0.5 && fx <= dx0 + dw + 0.5 && fy >= dy0 - 0.5 && fy <= dy0 + dh + 0.5 {
-                    let sy = min_y as f32 + ((fy - dy0) / dh) * ch - 0.5;
-                    let sx = min_x as f32 + ((fx - dx0) / dw) * cw - 0.5;
-                    let y0 = (sy.floor() as i32).clamp(min_y, max_y);
-                    let y1 = (y0 + 1).min(max_y);
-                    let ty = (sy - y0 as f32).clamp(0.0, 1.0);
-                    let x0 = (sx.floor() as i32).clamp(min_x, max_x);
-                    let x1 = (x0 + 1).min(max_x);
-                    let tx = (sx - x0 as f32).clamp(0.0, 1.0);
-                    let p00 = at(x0, y0);
-                    let p10 = at(x1, y0);
-                    let p01 = at(x0, y1);
-                    let p11 = at(x1, y1);
-                    let w00 = (1.0 - tx) * (1.0 - ty);
-                    let w10 = tx * (1.0 - ty);
-                    let w01 = (1.0 - tx) * ty;
-                    let w11 = tx * ty;
-                    let fg_b = p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11;
-                    let fg_g = p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11;
-                    let fg_r = p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11;
-                    let fg_a = ((p00[3] as f32 * w00 + p10[3] as f32 * w10 + p01[3] as f32 * w01 + p11[3] as f32 * w11) / 255.0).clamp(0.0, 1.0);
-                    r = fg_r * fg_a + r * (1.0 - fg_a);
-                    g = fg_g * fg_a + g * (1.0 - fg_a);
-                    b = fg_b * fg_a + b * (1.0 - fg_a);
+                if x >= dx0 && x < dx0 + dw_i && y >= dy0 && y < dy0 + dh_i {
+                    let fi = ((y - dy0) as usize * dw_i as usize + (x - dx0) as usize) * 4;
+                    let fb = fg[fi] as f32;
+                    let fg_c = fg[fi + 1] as f32;
+                    let fr = fg[fi + 2] as f32;
+                    let ifa = (255 - fg[fi + 3] as i32) as f32 / 255.0;
+                    r = fr + r * ifa;
+                    g = fg_c + g * ifa;
+                    b = fb + b * ifa;
                 }
 
                 let ai = ((card_cov * 255.0).round() as u32).min(255);
                 let oi = ((y as u32 * target + x as u32) * 4) as usize;
-                out[oi] = ((b.round() as u32 * ai + 127) / 255).min(255) as u8;
-                out[oi + 1] = ((g.round() as u32 * ai + 127) / 255).min(255) as u8;
-                out[oi + 2] = ((r.round() as u32 * ai + 127) / 255).min(255) as u8;
+                out[oi] = ((b.round().clamp(0.0, 255.0) as u32 * ai + 127) / 255).min(ai) as u8;
+                out[oi + 1] = ((g.round().clamp(0.0, 255.0) as u32 * ai + 127) / 255).min(ai) as u8;
+                out[oi + 2] = ((r.round().clamp(0.0, 255.0) as u32 * ai + 127) / 255).min(ai) as u8;
                 out[oi + 3] = ai as u8;
             }
         }
@@ -628,66 +633,74 @@ fn normalize_and_premultiply(
     let fill_ratio = if is_sharp_rect || edge_opaque { 0.85 } else { 0.90 };
     let fit = target as f32 * fill_ratio;
     let scale = (fit / cw).min(fit / ch);
-    let dw = (cw * scale).round().max(1.0);
-    let dh = (ch * scale).round().max(1.0);
-    let dx0 = (target as f32 - dw) * 0.5;
-    let dy0 = (target as f32 - dh) * 0.5;
+    let dw_i = (cw * scale).round().max(1.0) as i32;
+    let dh_i = (ch * scale).round().max(1.0) as i32;
+    let dx0 = ((target as i32 - dw_i) as f32 * 0.5).round() as i32;
+    let dy0 = ((target as i32 - dh_i) as f32 * 0.5).round() as i32;
 
+    // 圆形/异形图标外侧使用透明零填充（clamp_edge=false），彻底消除四边中点像素外扩导致的突出畸变
+    let cropped = crate::ui::resample_premul_bgra(
+        &premul,
+        iw,
+        ih,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        dw_i,
+        dh_i,
+        is_sharp_rect,
+    );
+
+    let dw = dw_i as f32;
+    let dh = dh_i as f32;
     let rad = (dw.min(dh) * 0.12).max(3.0);
-    let half_w = dw * 0.5 - rad;
-    let half_h = dh * 0.5 - rad;
-    let rcx = dx0 + dw * 0.5;
-    let rcy = dy0 + dh * 0.5;
+    let half_w = (dw * 0.5 - rad).max(0.0);
+    let half_h = (dh * 0.5 - rad).max(0.0);
+    let rcx = dx0 as f32 + dw * 0.5;
+    let rcy = dy0 as f32 + dh * 0.5;
 
-    for y in 0..target as i32 {
-        let fy_out = y as f32 + 0.5;
-        if fy_out < dy0 - 0.5 || fy_out > dy0 + dh + 0.5 {
+    for y in 0..dh_i {
+        let oy = dy0 + y;
+        if oy < 0 || oy >= target as i32 {
             continue;
         }
-        let sy = min_y as f32 + ((fy_out - dy0) / dh) * ch - 0.5;
-        let y0 = (sy.floor() as i32).clamp(min_y, max_y);
-        let y1 = (y0 + 1).min(max_y);
-        let ty = (sy - y0 as f32).clamp(0.0, 1.0);
-
-        for x in 0..target as i32 {
-            let fx_out = x as f32 + 0.5;
-            if fx_out < dx0 - 0.5 || fx_out > dx0 + dw + 0.5 {
+        let fy_out = oy as f32 + 0.5;
+        let srow = y as usize * dw_i as usize * 4;
+        let drow = oy as usize * target as usize * 4;
+        for x in 0..dw_i {
+            let ox = dx0 + x;
+            if ox < 0 || ox >= target as i32 {
                 continue;
             }
-            let sx = min_x as f32 + ((fx_out - dx0) / dw) * cw - 0.5;
-            let x0 = (sx.floor() as i32).clamp(min_x, max_x);
-            let x1 = (x0 + 1).min(max_x);
-            let tx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let si = srow + x as usize * 4;
+            let mut b = cropped[si];
+            let mut g = cropped[si + 1];
+            let mut r = cropped[si + 2];
+            let mut a = cropped[si + 3];
 
-            let p00 = at(x0, y0);
-            let p10 = at(x1, y0);
-            let p01 = at(x0, y1);
-            let p11 = at(x1, y1);
-            let w00 = (1.0 - tx) * (1.0 - ty);
-            let w10 = tx * (1.0 - ty);
-            let w01 = (1.0 - tx) * ty;
-            let w11 = tx * ty;
-
-            let b = p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11;
-            let g = p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11;
-            let r = p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11;
-            let mut a = p00[3] as f32 * w00 + p10[3] as f32 * w10 + p01[3] as f32 * w01 + p11[3] as f32 * w11;
-
-            // 若原始图像边缘不透明，使用抗锯齿圆角遮罩消除直角或白框边角
             if is_sharp_rect {
+                let fx_out = ox as f32 + 0.5;
                 let qx = (fx_out - rcx).abs() - half_w;
                 let qy = (fy_out - rcy).abs() - half_h;
                 let sd = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - rad;
                 let cov = (0.5 - sd).clamp(0.0, 1.0);
-                a *= cov;
+                if cov < 1.0 {
+                    let c256 = (cov * 256.0).round() as u32;
+                    let na = (((a as u32 * c256 + 128) >> 8).min(255)) as u8;
+                    let nam = na as u32;
+                    b = (((b as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    g = (((g as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    r = (((r as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    a = na;
+                }
             }
 
-            let ai = (a.round() as u32).min(255);
-            let oi = ((y as u32 * target + x as u32) * 4) as usize;
-            out[oi] = ((b.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 1] = ((g.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 2] = ((r.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 3] = ai as u8;
+            let oi = drow + ox as usize * 4;
+            out[oi] = b;
+            out[oi + 1] = g;
+            out[oi + 2] = r;
+            out[oi + 3] = a;
         }
     }
     (out, target, target)
@@ -767,6 +780,68 @@ mod tests {
         // 卡片本体应该被放大填充至接近目标边长 85%（中心 10..89 内应全为绿色实体）
         let edge_pt = ((50 * 100 + 12) * 4) as usize;
         assert!(out[edge_pt + 3] > 230 && out[edge_pt + 1] > 180);
+    }
+
+    #[test]
+    fn circular_edge_touching_icon_has_no_cardinal_protrusions() {
+        // 模拟贴边正圆形图标（如 Clash Verge），四极点触碰画布边界
+        let sz = 128u32;
+        let mut px = vec![0u8; (sz * sz * 4) as usize];
+        let c = 63.5f32;
+        let rad = 63.5f32;
+        for y in 0..sz {
+            for x in 0..sz {
+                let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
+                let cov = (rad + 0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let i = ((y * sz + x) * 4) as usize;
+                    px[i] = 240;
+                    px[i + 1] = 130;
+                    px[i + 2] = 220;
+                    px[i + 3] = (cov * 255.0).round() as u8;
+                }
+            }
+        }
+        let target = 192u32;
+        let (out, ow, oh) = normalize_and_premultiply(px, sz, sz, target);
+        assert_eq!((ow, oh), (target, target));
+        // 校验输出严格满足预乘 Alpha 不变量，且从真实圆心测量的 8 个方向半径一致（无四向突出）
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (target as i32, target as i32, -1i32, -1i32);
+        for y in 0..target as i32 {
+            for x in 0..target as i32 {
+                let i = (y as usize * target as usize + x as usize) * 4;
+                let a = out[i + 3];
+                assert!(out[i] <= a && out[i + 1] <= a && out[i + 2] <= a);
+                if a >= 128 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let cx = (min_x + max_x) as f32 * 0.5;
+        let cy = (min_y + max_y) as f32 * 0.5;
+        let measure_r = |dx: f32, dy: f32| -> f32 {
+            let mut max_r = 0.0f32;
+            for step in 0..220 {
+                let r = step as f32 * 0.5;
+                let x = (cx + dx * r).round() as i32;
+                let y = (cy + dy * r).round() as i32;
+                if x >= 0 && y >= 0 && x < target as i32 && y < target as i32 {
+                    if out[(y as usize * target as usize + x as usize) * 4 + 3] >= 128 {
+                        max_r = r;
+                    }
+                }
+            }
+            max_r
+        };
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        let r_diag = measure_r(d, d);
+        for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+            let r = measure_r(dx, dy);
+            assert!((r - r_diag).abs() <= 1.0, "cardinal r={r} vs diag r={r_diag}");
+        }
     }
 
     #[test]

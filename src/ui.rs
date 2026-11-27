@@ -1,6 +1,6 @@
 //! 共享软件抗锯齿绘图与现代界面组件库（32bpp DIB 像素缓冲）。
 //!
-//! 统一封装圆角矩形、抗锯齿圆/线、图标双线性缩放与阴影、文字阴影与测量、
+//! 统一封装圆角矩形、抗锯齿圆/线、图标 Lanczos3 高清重采样、文字阴影与测量、
 //! 现代复选框/开关/按钮/滚动条、矢量手势轨迹、火箭徽标与 100ms Tooltip 浮层。
 
 use windows::core::w;
@@ -375,28 +375,6 @@ impl Surface {
             | (nb.min(255.0) as u32);
     }
 
-    /// 用整数混合预乘 BGRA 像素到指定坐标（0..255）。
-    #[inline]
-    fn blend_premul_u8(&mut self, x: i32, y: i32, b: u32, g: u32, r: u32, a: u32) {
-        if a == 0 || !self.in_bounds(x, y) {
-            return;
-        }
-        let p = unsafe { &mut *self.ptr.add(y as usize * self.w + x as usize) };
-        if a >= 255 {
-            *p = 0xFF00_0000 | (r << 16) | (g << 8) | b;
-            return;
-        }
-        let ia = 255 - a;
-        let dst = *p;
-        let dr = (dst >> 16) & 0xFF;
-        let dg = (dst >> 8) & 0xFF;
-        let db = dst & 0xFF;
-        let nr = (r + (dr * ia + 127) / 255).min(255);
-        let ng = (g + (dg * ia + 127) / 255).min(255);
-        let nb = (b + (db * ia + 127) / 255).min(255);
-        *p = 0xFF00_0000 | (nr << 16) | (ng << 8) | nb;
-    }
-
     /// 计算当前裁剪区与目标矩形的交集边界。
     fn clamp_bounds(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> (i32, i32, i32, i32) {
         let mut lx0 = x0.max(0);
@@ -658,81 +636,36 @@ impl Surface {
         }
     }
 
-    /// 双线性缩放并绘制预乘 BGRA 图标，可选柔和投影（用于启动台图标质感增强）。
-    pub fn draw_icon_bilinear(&mut self, icon: &IconPixels, cx: f32, cy: f32, target_size: f32, with_shadow: bool, shadow_offset: f32) {
+    /// 使用 Lanczos3 高品质重采样并绘制预乘 BGRA 图标（无投影，用于设置列表与添加弹窗）。
+    pub fn draw_icon_resampled(&mut self, icon: &IconPixels, cx: f32, cy: f32, target_size: f32) {
         if icon.w == 0 || icon.h == 0 || target_size <= 1.0 {
             return;
         }
         let k = (target_size / icon.w as f32).min(target_size / icon.h as f32);
         let dw = (icon.w as f32 * k).round().max(1.0) as i32;
         let dh = (icon.h as f32 * k).round().max(1.0) as i32;
-        let dx0 = (cx - dw as f32 * 0.5).round() as i32;
-        let dy0 = (cy - dh as f32 * 0.5).round() as i32;
-
-        let iw = icon.w as i32;
-        let ih = icon.h as i32;
-        let src = icon.px.as_slice();
-        let inv_x = iw as f32 / dw as f32;
-        let inv_y = ih as f32 / dh as f32;
-
-        // 先绘制柔和阴影，再叠加图标本体
-        if with_shadow && shadow_offset >= 1.0 {
-            let so = shadow_offset.round() as i32;
-            let (sx0, sy0, sx1, sy1) = self.clamp_bounds(dx0 - 1, dy0 + so - 1, dx0 + dw + 1, dy0 + dh + so + 2);
-            for y in sy0..sy1 {
-                let fy = ((y - (dy0 + so)) as f32 + 0.5) * inv_y - 0.5;
-                let iy = (fy.round() as i32).clamp(0, ih - 1);
-                let row_off = (iy as usize * icon.w as usize) * 4;
-                for x in sx0..sx1 {
-                    let fx = ((x - dx0) as f32 + 0.5) * inv_x - 0.5;
-                    let ix = (fx.round() as i32).clamp(0, iw - 1);
-                    let a = src[row_off + ix as usize * 4 + 3] as u32;
-                    if a > 16 {
-                        let sa = (a * 68) >> 8; // ~26% 柔和黑影
-                        self.blend_premul_u8(x, y, 0, 0, 0, sa);
-                    }
-                }
-            }
-        }
-
-        let (bx0, by0, bx1, by1) = self.clamp_bounds(dx0, dy0, dx0 + dw, dy0 + dh);
-        if bx0 >= bx1 || by0 >= by1 {
+        if dw == icon.w as i32 && dh == icon.h as i32 {
+            self.draw_icon_1to1(icon, cx, cy, dh);
             return;
         }
-        for y in by0..by1 {
-            let fy = ((y - dy0) as f32 + 0.5) * inv_y - 0.5;
-            let y0 = (fy.floor() as i32).clamp(0, ih - 1);
-            let y1 = (y0 + 1).min(ih - 1);
-            let ty = (fy - y0 as f32).clamp(0.0, 1.0);
-            let wy1 = (ty * 256.0).round() as u32;
-            let wy0 = 256 - wy1;
-            let row0 = (y0 as usize * icon.w as usize) * 4;
-            let row1 = (y1 as usize * icon.w as usize) * 4;
-            for x in bx0..bx1 {
-                let fx = ((x - dx0) as f32 + 0.5) * inv_x - 0.5;
-                let x0 = (fx.floor() as i32).clamp(0, iw - 1);
-                let x1 = (x0 + 1).min(iw - 1);
-                let tx = (fx - x0 as f32).clamp(0.0, 1.0);
-                let wx1 = (tx * 256.0).round() as u32;
-                let wx0 = 256 - wx1;
-
-                let i00 = row0 + x0 as usize * 4;
-                let i10 = row0 + x1 as usize * 4;
-                let i01 = row1 + x0 as usize * 4;
-                let i11 = row1 + x1 as usize * 4;
-
-                let w00 = (wx0 * wy0) >> 8;
-                let w10 = (wx1 * wy0) >> 8;
-                let w01 = (wx0 * wy1) >> 8;
-                let w11 = (wx1 * wy1) >> 8;
-
-                let b = (src[i00] as u32 * w00 + src[i10] as u32 * w10 + src[i01] as u32 * w01 + src[i11] as u32 * w11 + 128) >> 8;
-                let g = (src[i00 + 1] as u32 * w00 + src[i10 + 1] as u32 * w10 + src[i01 + 1] as u32 * w01 + src[i11 + 1] as u32 * w11 + 128) >> 8;
-                let r = (src[i00 + 2] as u32 * w00 + src[i10 + 2] as u32 * w10 + src[i01 + 2] as u32 * w01 + src[i11 + 2] as u32 * w11 + 128) >> 8;
-                let a = (src[i00 + 3] as u32 * w00 + src[i10 + 3] as u32 * w10 + src[i01 + 3] as u32 * w01 + src[i11 + 3] as u32 * w11 + 128) >> 8;
-                self.blend_premul_u8(x, y, b, g, r, a);
-            }
-        }
+        let buf = resample_premul_bgra(
+            icon.px.as_slice(),
+            icon.w as i32,
+            icon.h as i32,
+            0,
+            0,
+            icon.w as i32 - 1,
+            icon.h as i32 - 1,
+            dw,
+            dh,
+            false,
+        );
+        let sprite = IconPixels {
+            w: dw as u32,
+            h: dh as u32,
+            px: std::sync::Arc::new(buf),
+        };
+        self.draw_icon_1to1(&sprite, cx, cy, dh);
     }
 
     /// 1:1 直接贴图（用于预烘焙含阴影图标，避免逐帧双线性重采样，保障左右滑页丝滑 60+ FPS）。
@@ -781,7 +714,172 @@ impl Surface {
     }
 }
 
-/// 检测已缩放到目标正方形区域的图标是否为卡片型（四边中段呈直线分布），避免误裁圆形或异形图标。
+#[inline]
+fn lanczos3(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 1e-6 {
+        return 1.0;
+    }
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    let px = std::f32::consts::PI * ax;
+    (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0))
+}
+
+/// 对预乘 BGRA 图像指定区域执行自适应支持域 Lanczos3 两阶段（水平+垂直）高清重采样。
+/// `clamp_edge`: true 时边界向外钳位（配合随后 SDF 圆角裁切的实心方卡）；false 时源矩形外按透明零值填充（消除圆形/异形图标边缘突出）。
+pub fn resample_premul_bgra(
+    src: &[u8],
+    sw: i32,
+    sh: i32,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    dw: i32,
+    dh: i32,
+    clamp_edge: bool,
+) -> Vec<u8> {
+    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+        return Vec::new();
+    }
+    let min_x = min_x.clamp(0, sw - 1);
+    let min_y = min_y.clamp(0, sh - 1);
+    let max_x = max_x.clamp(min_x, sw - 1);
+    let max_y = max_y.clamp(min_y, sh - 1);
+    let cw = (max_x - min_x + 1) as usize;
+    let ch = (max_y - min_y + 1) as usize;
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+
+    // 尺寸与区域完全一致时直接返回副本，避免不必要的滤波损耗
+    if min_x == 0 && min_y == 0 && max_x == sw - 1 && max_y == sh - 1 && dw == sw && dh == sh {
+        return src.to_vec();
+    }
+
+    let ratio_x = cw as f32 / dw as f32;
+    let ratio_y = ch as f32 / dh as f32;
+    let scale_x = ratio_x.max(1.0);
+    let scale_y = ratio_y.max(1.0);
+    let sup_x = 3.0 * scale_x;
+    let sup_y = 3.0 * scale_y;
+    let inv_kx = 1.0 / scale_x;
+    let inv_ky = 1.0 / scale_y;
+
+    // 预计算水平方向每一目标列的采样起点与归一化 Lanczos3 权重表
+    let mut x_taps: Vec<(i32, Vec<f32>)> = Vec::with_capacity(dw_u);
+    for ox in 0..dw {
+        let cx = min_x as f32 + ((ox as f32 + 0.5) / dw as f32) * cw as f32 - 0.5;
+        let ix0 = (cx - sup_x).ceil() as i32;
+        let ix1 = (cx + sup_x).floor() as i32;
+        let mut weights = Vec::with_capacity((ix1 - ix0 + 1).max(0) as usize);
+        let mut wsum = 0.0f32;
+        for ix in ix0..=ix1 {
+            let w = lanczos3((ix as f32 - cx) * inv_kx);
+            weights.push(w);
+            wsum += w;
+        }
+        if wsum.abs() > 1e-6 {
+            let inv = 1.0 / wsum;
+            for w in &mut weights {
+                *w *= inv;
+            }
+        }
+        x_taps.push((ix0, weights));
+    }
+
+    let sw_u = sw as usize;
+    let mut inter = vec![0.0f32; ch * dw_u * 4];
+    for (row_i, sy) in (min_y..=max_y).enumerate() {
+        let srow = sy as usize * sw_u * 4;
+        let drow = row_i * dw_u * 4;
+        for (ox, (ix0, weights)) in x_taps.iter().enumerate() {
+            let (mut b, mut g, mut r, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for (k, &w) in weights.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                let ix = *ix0 + k as i32;
+                let sx = if clamp_edge {
+                    ix.clamp(min_x, max_x)
+                } else if ix < min_x || ix > max_x {
+                    continue;
+                } else {
+                    ix
+                };
+                let si = srow + sx as usize * 4;
+                b += src[si] as f32 * w;
+                g += src[si + 1] as f32 * w;
+                r += src[si + 2] as f32 * w;
+                a += src[si + 3] as f32 * w;
+            }
+            let di = drow + ox * 4;
+            inter[di] = b;
+            inter[di + 1] = g;
+            inter[di + 2] = r;
+            inter[di + 3] = a;
+        }
+    }
+
+    // 预计算垂直方向每一目标行的采样起点与归一化 Lanczos3 权重表
+    let mut y_taps: Vec<(i32, Vec<f32>)> = Vec::with_capacity(dh_u);
+    for oy in 0..dh {
+        let cy = ((oy as f32 + 0.5) / dh as f32) * ch as f32 - 0.5;
+        let iy0 = (cy - sup_y).ceil() as i32;
+        let iy1 = (cy + sup_y).floor() as i32;
+        let mut weights = Vec::with_capacity((iy1 - iy0 + 1).max(0) as usize);
+        let mut wsum = 0.0f32;
+        for iy in iy0..=iy1 {
+            let w = lanczos3((iy as f32 - cy) * inv_ky);
+            weights.push(w);
+            wsum += w;
+        }
+        if wsum.abs() > 1e-6 {
+            let inv = 1.0 / wsum;
+            for w in &mut weights {
+                *w *= inv;
+            }
+        }
+        y_taps.push((iy0, weights));
+    }
+
+    let mut out = vec![0u8; dw_u * dh_u * 4];
+    for (oy, (iy0, weights)) in y_taps.iter().enumerate() {
+        let drow = oy * dw_u * 4;
+        for ox in 0..dw_u {
+            let (mut b, mut g, mut r, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for (k, &w) in weights.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                let iy = *iy0 + k as i32;
+                let ry = if clamp_edge {
+                    iy.clamp(0, ch as i32 - 1)
+                } else if iy < 0 || iy >= ch as i32 {
+                    continue;
+                } else {
+                    iy
+                };
+                let si = (ry as usize * dw_u + ox) * 4;
+                b += inter[si] * w;
+                g += inter[si + 1] * w;
+                r += inter[si + 2] * w;
+                a += inter[si + 3] * w;
+            }
+            let ai = a.round().clamp(0.0, 255.0) as u8;
+            let af = ai as f32;
+            let oi = drow + ox * 4;
+            out[oi] = b.round().clamp(0.0, af) as u8;
+            out[oi + 1] = g.round().clamp(0.0, af) as u8;
+            out[oi + 2] = r.round().clamp(0.0, af) as u8;
+            out[oi + 3] = ai;
+        }
+    }
+    out
+}
+
+/// 检测已缩放到目标正方形区域的图标是否为近似方形卡片（四边中段平直且长宽比接近 1:1），避免误裁圆形或记事本等异形图标。
 fn is_card_shape(px: &[u8], w: usize, h: usize) -> Option<(f32, f32, f32, f32)> {
     let at_a = |x: i32, y: i32| -> u8 {
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -834,17 +932,24 @@ fn is_card_shape(px: &[u8], w: usize, h: usize) -> Option<(f32, f32, f32, f32)> 
     }
     let cw = (max_x - min_x + 1) as f32;
     let ch = (max_y - min_y + 1) as f32;
-    // 检测上下左右四条边的中间 24% 区间是否平坦贴边不透明（正圆形在左右偏移 12% 时边缘已向内回落，卡片则始终满透明阈值）
-    let ox = ((cw * 0.14).round() as i32).max(2);
-    let oy = ((ch * 0.14).round() as i32).max(2);
+    // 排除记事本、计算器等非方卡比例图标，防止误裁顶部装订环或底部圆角
+    if cw.max(ch) > cw.min(ch) * 1.18 {
+        return None;
+    }
+    // 按尺寸等比内缩并检查四边 ±22% 及 ±11% 五点是否平坦不透明，严格区分对称圆角方卡与圆形/异形图标
+    let in_x = (cw * 0.02).round().clamp(1.0, 3.0) as i32;
+    let in_y = (ch * 0.02).round().clamp(1.0, 3.0) as i32;
+    let ox = ((cw * 0.22).round() as i32).max(2);
+    let oy = ((ch * 0.22).round() as i32).max(2);
+    let ox2 = ((cw * 0.11).round() as i32).max(1);
+    let oy2 = ((ch * 0.11).round() as i32).max(1);
     let cx = (min_x + max_x) / 2;
     let cy = (min_y + max_y) / 2;
-    let top_flat = at_a(cx - ox, min_y + 2) > 180 && at_a(cx, min_y + 2) > 180 && at_a(cx + ox, min_y + 2) > 180;
-    let bot_flat = at_a(cx - ox, max_y - 2) > 180 && at_a(cx, max_y - 2) > 180 && at_a(cx + ox, max_y - 2) > 180;
-    let left_flat = at_a(min_x + 2, cy - oy) > 180 && at_a(min_x + 2, cy) > 180 && at_a(min_x + 2, cy + oy) > 180;
-    let right_flat = at_a(max_x - 2, cy - oy) > 180 && at_a(max_x - 2, cy) > 180 && at_a(max_x - 2, cy + oy) > 180;
-    let flat_sides = [top_flat, bot_flat, left_flat, right_flat].iter().filter(|&&b| b).count();
-    if flat_sides >= 3 {
+    let top_flat = [-ox, -ox2, 0, ox2, ox].iter().all(|&d| at_a(cx + d, min_y + in_y) > 180);
+    let bot_flat = [-ox, -ox2, 0, ox2, ox].iter().all(|&d| at_a(cx + d, max_y - in_y) > 180);
+    let left_flat = [-oy, -oy2, 0, oy2, oy].iter().all(|&d| at_a(min_x + in_x, cy + d) > 180);
+    let right_flat = [-oy, -oy2, 0, oy2, oy].iter().all(|&d| at_a(max_x - in_x, cy + d) > 180);
+    if top_flat && bot_flat && left_flat && right_flat {
         Some((min_x as f32, min_y as f32, cw, ch))
     } else {
         None
@@ -891,102 +996,94 @@ fn apply_card_roundness(fg: &mut [u8], w: usize, h: usize, round_ratio: f32) {
                     fg[oi..oi + 4].fill(0);
                 } else if cov < 1.0 {
                     let c256 = (cov * 256.0).round() as u32;
-                    fg[oi] = ((fg[oi] as u32 * c256) >> 8) as u8;
-                    fg[oi + 1] = ((fg[oi + 1] as u32 * c256) >> 8) as u8;
-                    fg[oi + 2] = ((fg[oi + 2] as u32 * c256) >> 8) as u8;
-                    fg[oi + 3] = ((fg[oi + 3] as u32 * c256) >> 8) as u8;
+                    let na = (((fg[oi + 3] as u32 * c256 + 128) >> 8).min(255)) as u8;
+                    let nam = na as u32;
+                    fg[oi] = (((fg[oi] as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    fg[oi + 1] = (((fg[oi + 1] as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    fg[oi + 2] = (((fg[oi + 2] as u32 * c256 + 128) >> 8).min(nam)) as u8;
+                    fg[oi + 3] = na;
                 }
             }
         }
     }
 }
 
-/// 生成按指定圆润度实时裁切后的图标副本（用于悬停放大等直接双线性绘制场景）。
-pub fn clip_icon_roundness(src: &IconPixels, round_ratio: f32) -> IconPixels {
-    if round_ratio <= 0.125 || is_card_shape(&src.px, src.w as usize, src.h as usize).is_none() {
-        return src.clone();
-    }
-    let mut buf = src.px.as_ref().clone();
-    apply_card_roundness(&mut buf, src.w as usize, src.h as usize, round_ratio);
-    IconPixels {
-        w: src.w,
-        h: src.h,
-        px: std::sync::Arc::new(buf),
-    }
-}
-
-/// 将源图标一次性缩放到目标尺寸、按配置圆润度裁切并烘焙柔和投影，供主网格高速 1:1 渲染使用。
+/// 将源图标一次性通过 Lanczos3 缩放到目标尺寸、按配置圆润度裁切并可选烘焙柔和投影，供主网格高速 1:1 渲染使用。
 pub fn bake_icon_sprite(src: &IconPixels, target_size: i32, shadow_offset: i32, round_ratio: f32) -> IconPixels {
     let sz = target_size.max(8) as u32;
     let so = shadow_offset.max(0) as u32;
     let bw = sz;
-    let bh = sz + so + 2;
-    let mut fg = vec![0u8; (sz * sz * 4) as usize];
-    let iw = src.w as i32;
-    let ih = src.h as i32;
-    let sdata = src.px.as_slice();
-    let k = (sz as f32 / src.w.max(1) as f32).min(sz as f32 / src.h.max(1) as f32);
-    let dw = (src.w as f32 * k).round().max(1.0) as i32;
-    let dh = (src.h as f32 * k).round().max(1.0) as i32;
+    let bh = if so > 0 { sz + so + 2 } else { sz };
+    let iw = src.w.max(1) as i32;
+    let ih = src.h.max(1) as i32;
+    let k = (sz as f32 / iw as f32).min(sz as f32 / ih as f32);
+    let dw = (iw as f32 * k).round().max(1.0) as i32;
+    let dh = (ih as f32 * k).round().max(1.0) as i32;
     let dx0 = (sz as i32 - dw) / 2;
     let dy0 = (sz as i32 - dh) / 2;
-    let inv_x = iw as f32 / dw as f32;
-    let inv_y = ih as f32 / dh as f32;
 
-    // 1. 双线性采样源图标到前景正方形图层
-    for y in dy0.max(0)..(dy0 + dh).min(sz as i32) {
-        let fy = ((y - dy0) as f32 + 0.5) * inv_y - 0.5;
-        let y0 = (fy.floor() as i32).clamp(0, ih - 1);
-        let y1 = (y0 + 1).min(ih - 1);
-        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
-        let wy1 = (ty * 256.0).round() as u32;
-        let wy0 = 256 - wy1;
-        let row0 = (y0 as usize * src.w as usize) * 4;
-        let row1 = (y1 as usize * src.w as usize) * 4;
-        for x in dx0.max(0)..(dx0 + dw).min(sz as i32) {
-            let fx = ((x - dx0) as f32 + 0.5) * inv_x - 0.5;
-            let x0 = (fx.floor() as i32).clamp(0, iw - 1);
-            let x1 = (x0 + 1).min(iw - 1);
-            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
-            let wx1 = (tx * 256.0).round() as u32;
-            let wx0 = 256 - wx1;
-
-            let i00 = row0 + x0 as usize * 4;
-            let i10 = row0 + x1 as usize * 4;
-            let i01 = row1 + x0 as usize * 4;
-            let i11 = row1 + x1 as usize * 4;
-            let w00 = (wx0 * wy0) >> 8;
-            let w10 = (wx1 * wy0) >> 8;
-            let w01 = (wx0 * wy1) >> 8;
-            let w11 = (wx1 * wy1) >> 8;
-
-            let oi = (y as usize * sz as usize + x as usize) * 4;
-            fg[oi] = ((sdata[i00] as u32 * w00 + sdata[i10] as u32 * w10 + sdata[i01] as u32 * w01 + sdata[i11] as u32 * w11 + 128) >> 8).min(255) as u8;
-            fg[oi + 1] = ((sdata[i00 + 1] as u32 * w00 + sdata[i10 + 1] as u32 * w10 + sdata[i01 + 1] as u32 * w01 + sdata[i11 + 1] as u32 * w11 + 128) >> 8).min(255) as u8;
-            fg[oi + 2] = ((sdata[i00 + 2] as u32 * w00 + sdata[i10 + 2] as u32 * w10 + sdata[i01 + 2] as u32 * w01 + sdata[i11 + 2] as u32 * w11 + 128) >> 8).min(255) as u8;
-            fg[oi + 3] = ((sdata[i00 + 3] as u32 * w00 + sdata[i10 + 3] as u32 * w10 + sdata[i01 + 3] as u32 * w01 + sdata[i11 + 3] as u32 * w11 + 128) >> 8).min(255) as u8;
+    // 1. 使用自适应支持域 Lanczos3 采样源图标到前景正方形图层
+    let sampled = resample_premul_bgra(
+        src.px.as_slice(),
+        iw,
+        ih,
+        0,
+        0,
+        iw - 1,
+        ih - 1,
+        dw,
+        dh,
+        false,
+    );
+    let mut fg = if dw == sz as i32 && dh == sz as i32 && dx0 == 0 && dy0 == 0 {
+        sampled
+    } else {
+        let mut canvas = vec![0u8; (sz * sz * 4) as usize];
+        for y in 0..dh {
+            let oy = dy0 + y;
+            if oy < 0 || oy >= sz as i32 {
+                continue;
+            }
+            let srow = y as usize * dw as usize * 4;
+            let drow = oy as usize * sz as usize * 4;
+            for x in 0..dw {
+                let ox = dx0 + x;
+                if ox < 0 || ox >= sz as i32 {
+                    continue;
+                }
+                let si = srow + x as usize * 4;
+                let di = drow + ox as usize * 4;
+                canvas[di..di + 4].copy_from_slice(&sampled[si..si + 4]);
+            }
         }
-    }
+        canvas
+    };
 
     // 2. 卡片型图标按当前选定的圆角圆润度实时抗锯齿裁切四角
     apply_card_roundness(&mut fg, sz as usize, sz as usize, round_ratio);
 
-    // 3. 基于裁切后的前景 alpha 生成同步轮廓的柔和黑影并合成前景
+    // 3. 无投影时直接返回紧凑正方形精灵，避免额外内存与合成开销
+    if so == 0 {
+        return IconPixels {
+            w: bw,
+            h: bh,
+            px: std::sync::Arc::new(fg),
+        };
+    }
+
     let mut buf = vec![0u8; (bw * bh * 4) as usize];
-    if so >= 1 {
-        let so_i = so as i32;
-        for y in 0..sz as i32 {
-            let dy = y + so_i;
-            if dy < 0 || dy >= bh as i32 {
-                continue;
-            }
-            for x in 0..sz as i32 {
-                let si = (y as usize * sz as usize + x as usize) * 4;
-                let a = fg[si + 3] as u32;
-                if a > 16 {
-                    let di = (dy as usize * bw as usize + x as usize) * 4;
-                    buf[di + 3] = ((a * 64) >> 8) as u8;
-                }
+    let so_i = so as i32;
+    for y in 0..sz as i32 {
+        let dy = y + so_i;
+        if dy < 0 || dy >= bh as i32 {
+            continue;
+        }
+        for x in 0..sz as i32 {
+            let si = (y as usize * sz as usize + x as usize) * 4;
+            let a = fg[si + 3] as u32;
+            if a > 16 {
+                let di = (dy as usize * bw as usize + x as usize) * 4;
+                buf[di + 3] = ((a * 64) >> 8) as u8;
             }
         }
     }
@@ -2020,5 +2117,66 @@ mod tests {
             &[(text_rc, "🔔 自动换行彩色文本测试")],
         ));
         target.release();
+    }
+
+    #[test]
+    fn bake_icon_sprite_clips_square_cards_only_and_omits_shadow() {
+        // 1. 对称方形卡片应被按圆润度裁切四角，且 shadow_offset=0 时尺寸紧凑为 sz×sz
+        let sz = 128u32;
+        let mut card = vec![0u8; (sz * sz * 4) as usize];
+        for y in 12..116 {
+            for x in 12..116 {
+                let i = ((y * sz + x) * 4) as usize;
+                card[i] = 220;
+                card[i + 1] = 140;
+                card[i + 2] = 60;
+                card[i + 3] = 255;
+            }
+        }
+        let card_src = IconPixels { w: sz, h: sz, px: std::sync::Arc::new(card) };
+        let baked_card = bake_icon_sprite(&card_src, 112, 0, 0.225);
+        assert_eq!((baked_card.w, baked_card.h), (112, 112));
+        // 卡片四角（相对于卡片角点 (10,10) 内缩 3px）应已被圆角裁成透明，中心则保持实心
+        assert_eq!(baked_card.px[(12 * 112 + 12) * 4 + 3], 0);
+        assert_eq!(baked_card.px[(56 * 112 + 56) * 4 + 3], 255);
+
+        // 2. 正圆形图标不得被误判为卡片或产生四向突出
+        let mut circle = vec![0u8; (sz * sz * 4) as usize];
+        for y in 0..sz {
+            for x in 0..sz {
+                let d = ((x as f32 - 63.5).powi(2) + (y as f32 - 63.5).powi(2)).sqrt();
+                let cov = (54.0 + 0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let i = ((y * sz + x) * 4) as usize;
+                    let a = (cov * 255.0).round() as u8;
+                    circle[i] = a;
+                    circle[i + 1] = (a as f32 * 0.5).round() as u8;
+                    circle[i + 2] = a;
+                    circle[i + 3] = a;
+                }
+            }
+        }
+        assert!(is_card_shape(&circle, sz as usize, sz as usize).is_none());
+        let circle_src = IconPixels { w: sz, h: sz, px: std::sync::Arc::new(circle) };
+        let baked_circle = bake_icon_sprite(&circle_src, 112, 0, 0.34);
+        assert_eq!((baked_circle.w, baked_circle.h), (112, 112));
+        for ch in baked_circle.px.chunks_exact(4) {
+            assert!(ch[0] <= ch[3] && ch[1] <= ch[3] && ch[2] <= ch[3]);
+        }
+
+        // 3. 三角实心+右上角留空的文件夹形状不得被误判为方卡
+        let mut folder = vec![0u8; (sz * sz * 4) as usize];
+        for y in 16..112 {
+            for x in 12..116 {
+                if y < 32 && x > 62 {
+                    continue;
+                }
+                let i = ((y * sz + x) * 4) as usize;
+                folder[i + 1] = 200;
+                folder[i + 2] = 250;
+                folder[i + 3] = 255;
+            }
+        }
+        assert!(is_card_shape(&folder, sz as usize, sz as usize).is_none());
     }
 }

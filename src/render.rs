@@ -11,13 +11,13 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::config::roundness_ratio;
 use crate::ui::{
-    bake_icon_sprite, clip_icon_roundness, draw_text, draw_tooltip, make_font, measure_text, rgb,
-    DibTarget, IconPixels, Rgba, Surface, TextAlign,
+    bake_icon_sprite, draw_text, draw_tooltip, make_font, measure_text, rgb, DibTarget,
+    IconPixels, Rgba, Surface, TextAlign,
 };
 use crate::wallpaper::WallpaperTexture;
 
-const ICON_BUDGET: usize = 8 * 1024 * 1024;
-const SPRITE_BUDGET: usize = 8 * 1024 * 1024;
+const ICON_BUDGET: usize = 24 * 1024 * 1024;
+const SPRITE_BUDGET: usize = 12 * 1024 * 1024;
 
 const C_SEARCH_BORDER: Rgba = (1.0, 1.0, 1.0, 0.24);
 const C_TEXT: Rgba = (1.0, 1.0, 1.0, 0.96);
@@ -506,6 +506,18 @@ impl IconCache {
         self.sprite_bytes = 0;
     }
 
+    /// 隐藏后保留约一页常用图标缓存，兼顾空闲低内存占用与再次呼出瞬时响应。
+    pub fn trim_icons_to(&mut self, budget: usize) {
+        while self.bytes > budget {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(b) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub((b.w * b.h * 4) as usize);
+            }
+        }
+    }
+
     /// 隐藏后保留约一页常用图标精灵缓存，兼顾空闲低内存占用与再次呼出瞬时响应。
     pub fn trim_sprites_to(&mut self, budget: usize) {
         while self.sprite_bytes > budget {
@@ -766,12 +778,13 @@ impl Renderer {
         self.bg_sig = sig;
     }
 
-    /// 隐藏窗口后释放屏幕尺寸 DIB 与半分辨率背景，仅保留轻量一页图标精灵以消除二次呼出卡顿。
+    /// 隐藏窗口后释放屏幕尺寸 DIB 与半分辨率背景，仅保留轻量一页图标与精灵缓存以消除二次呼出卡顿。
     pub fn release_target(&mut self) {
         self.target.release();
         self.bg_half.release();
         self.bg_sig = (0, 0, 0, false);
-        self.icons.trim_sprites_to(2 * 1024 * 1024);
+        self.icons.trim_icons_to(6 * 1024 * 1024);
+        self.icons.trim_sprites_to(3 * 1024 * 1024);
     }
 
     pub fn add_icon(&mut self, key: &str, pixels: &[u8], w: u32, h: u32) {
@@ -818,10 +831,10 @@ impl Renderer {
         tw > max_w
     }
 
-    /// 绘制文件夹缩略图标（磨砂圆角卡片底板 + 最多 3×3 小图标预览，拖拽悬停时高亮描边）。
+    /// 绘制文件夹缩略图标（磨砂圆角卡片底板 + 最多 3×3 高清小图标预览，拖拽悬停时高亮描边）。
     #[allow(clippy::too_many_arguments)]
     fn paint_folder_icon(
-        &self,
+        &mut self,
         surface: &mut Surface,
         preview_keys: &[String],
         icon_cx: f32,
@@ -839,13 +852,6 @@ impl Renderer {
             bottom: (icon_cy + half).round() as i32,
         };
         let rad = (draw_sz * round_ratio.max(0.18)).max(4.0);
-        let shadow = RECT {
-            left: r.left,
-            top: r.top + (3.0 * s).round() as i32,
-            right: r.right,
-            bottom: r.bottom + (4.0 * s).round() as i32,
-        };
-        surface.fill_rrect(&shadow, rad, (0.0, 0.0, 0.0, 0.24));
 
         let bg = if is_drop_target {
             (0.26, 0.52, 0.96, 0.42)
@@ -889,10 +895,11 @@ impl Renderer {
             return;
         }
 
-        // 3×3 小图标预览网格
+        // 3×3 小图标预览网格（复用预烘焙 Lanczos3 精灵以兼顾清晰度与滑动流畅性）
         let pad = draw_sz * 0.14;
         let gap = draw_sz * 0.06;
         let mini_sz = ((draw_sz - pad * 2.0 - gap * 2.0) / 3.0).max(4.0);
+        let mini_sz_i = mini_sz.round().max(8.0) as i32;
         let origin_x = r.left as f32 + pad;
         let origin_y = r.top as f32 + pad;
         for (idx, key) in preview_keys.iter().take(9).enumerate() {
@@ -900,8 +907,8 @@ impl Renderer {
             let col = idx % 3;
             let mcx = origin_x + col as f32 * (mini_sz + gap) + mini_sz * 0.5;
             let mcy = origin_y + row as f32 * (mini_sz + gap) + mini_sz * 0.5;
-            if let Some(icon) = self.icons.get(key) {
-                surface.draw_icon_bilinear(&icon, mcx, mcy, mini_sz, false, 0.0);
+            if let Some(sprite) = self.icons.get_or_bake_sprite(key, mini_sz_i, 0, round_ratio) {
+                surface.draw_icon_1to1(&sprite, mcx, mcy, mini_sz_i);
             } else {
                 let mh = mini_sz * 0.5;
                 let mr = RECT {
@@ -934,7 +941,6 @@ impl Renderer {
         round_ratio: f32,
     ) {
         let s = self.scale;
-        let shadow_off = (3.0 * s).round() as i32;
 
         for (i, cell) in cells.iter().enumerate() {
             let Some(item) = items.get(i) else { break };
@@ -1021,24 +1027,20 @@ impl Renderer {
                     );
                 }
                 ViewItemKind::App => {
-                    if is_hov || is_prs {
-                        let draw_sz = if is_prs {
-                            icon_base as f32 * 0.94
-                        } else {
-                            icon_base as f32 * 1.07
-                        };
-                        if let Some(icon) = self.icons.get(&item.key) {
-                            let rounded = clip_icon_roundness(&icon, round_ratio);
-                            surface.draw_icon_bilinear(&rounded, icon_cx, icon_cy, draw_sz, true, 3.0 * s);
-                        } else {
-                            self.paint_fallback_icon(surface, dc, &item.name, icon_cx, icon_cy, draw_sz);
-                        }
-                    } else if let Some(sprite) =
-                        self.icons.get_or_bake_sprite(&item.key, icon_base, shadow_off, round_ratio)
-                    {
-                        surface.draw_icon_1to1(&sprite, icon_cx, icon_cy, icon_base);
+                    // 正常、悬停与按下态统一走预烘焙 Lanczos3 无阴影精灵缓存，保证清晰度与高帧率
+                    let draw_sz_i = if is_prs {
+                        (icon_base as f32 * 0.94).round().max(8.0) as i32
+                    } else if is_hov {
+                        (icon_base as f32 * 1.07).round().max(8.0) as i32
                     } else {
-                        self.paint_fallback_icon(surface, dc, &item.name, icon_cx, icon_cy, icon_base as f32);
+                        icon_base
+                    };
+                    if let Some(sprite) =
+                        self.icons.get_or_bake_sprite(&item.key, draw_sz_i, 0, round_ratio)
+                    {
+                        surface.draw_icon_1to1(&sprite, icon_cx, icon_cy, draw_sz_i);
+                    } else {
+                        self.paint_fallback_icon(surface, dc, &item.name, icon_cx, icon_cy, draw_sz_i as f32);
                     }
                 }
             }
@@ -1492,14 +1494,16 @@ impl Renderer {
             }
         }
 
-        // 8. 拖拽图标跟手浮层
+        // 8. 拖拽图标跟手浮层（无投影，采用 Lanczos3 预烘焙精灵保持跟手顺滑）
         if let Some(ghost) = &f.drag_ghost {
             let draw_sz = layout.icon_size as f32 * 1.12;
+            let draw_sz_i = draw_sz.round().max(8.0) as i32;
             let gx = ghost.x as f32;
             let gy = ghost.y as f32;
-            if let Some(icon) = self.icons.get(ghost.icon_key) {
-                let rounded = clip_icon_roundness(&icon, round_ratio);
-                surface.draw_icon_bilinear(&rounded, gx, gy, draw_sz, true, 4.0 * s);
+            if let Some(sprite) =
+                self.icons.get_or_bake_sprite(ghost.icon_key, draw_sz_i, 0, round_ratio)
+            {
+                surface.draw_icon_1to1(&sprite, gx, gy, draw_sz_i);
             } else {
                 self.paint_fallback_icon(&mut surface, dc, ghost.name, gx, gy, draw_sz);
             }
@@ -1526,36 +1530,9 @@ impl Renderer {
             }
         }
 
-        // 9. 自定义磨砂右键菜单（浮层）
+        // 9. 自定义磨砂右键菜单（浮层，无下方投影）
         if let Some(menu) = f.context_menu {
-            let shadow = RECT {
-                left: menu.rect.left,
-                top: menu.rect.top + (4.0 * s) as i32,
-                right: menu.rect.right,
-                bottom: menu.rect.bottom + (6.0 * s) as i32,
-            };
-            surface.fill_rrect(&shadow, 10.0 * s, (0.0, 0.0, 0.0, 0.35));
-            surface.fill_rrect(&menu.rect, 10.0 * s, rgb(0x1E232E, 0.94));
-            surface.stroke_rrect(&menu.rect, 10.0 * s, (1.0 * s).max(1.0), (1.0, 1.0, 1.0, 0.16));
-            for (i, item) in menu.items.iter().enumerate() {
-                let ir = &menu.item_rects[i];
-                if menu.hover == Some(i) {
-                    let hbg = if item.danger { rgb(0xDC2626, 0.85) } else { rgb(0x1677FF, 0.90) };
-                    surface.fill_rrect(ir, 6.0 * s, hbg);
-                }
-                let tr = RECT {
-                    left: ir.left + (12.0 * s) as i32,
-                    top: ir.top,
-                    right: ir.right - (12.0 * s) as i32,
-                    bottom: ir.bottom,
-                };
-                let tc = if item.danger && menu.hover != Some(i) {
-                    rgb(0xFCA5A5, 0.96)
-                } else {
-                    C_TEXT
-                };
-                draw_text(dc, item.label, self.fonts.menu, &tr, tc, TextAlign::Left, false, false);
-            }
+            self.paint_context_menu(&mut surface, dc, menu);
         }
 
         // 10. 自定义 100ms 悬停 Tooltip
@@ -1570,6 +1547,41 @@ impl Renderer {
             let _ = EndPaint(hwnd, &ps);
         }
         true
+    }
+
+    /// 绘制自定义磨砂右键菜单浮层（不绘制菜单下方阴影）。
+    fn paint_context_menu(
+        &self,
+        surface: &mut Surface,
+        dc: windows::Win32::Graphics::Gdi::HDC,
+        menu: &ContextMenu,
+    ) {
+        let s = self.scale;
+        surface.fill_rrect(&menu.rect, 10.0 * s, rgb(0x1E232E, 0.94));
+        surface.stroke_rrect(&menu.rect, 10.0 * s, (1.0 * s).max(1.0), (1.0, 1.0, 1.0, 0.16));
+        for (i, item) in menu.items.iter().enumerate() {
+            let ir = &menu.item_rects[i];
+            if menu.hover == Some(i) {
+                let hbg = if item.danger {
+                    rgb(0xDC2626, 0.85)
+                } else {
+                    rgb(0x1677FF, 0.90)
+                };
+                surface.fill_rrect(ir, 6.0 * s, hbg);
+            }
+            let tr = RECT {
+                left: ir.left + (12.0 * s) as i32,
+                top: ir.top,
+                right: ir.right - (12.0 * s) as i32,
+                bottom: ir.bottom,
+            };
+            let tc = if item.danger && menu.hover != Some(i) {
+                rgb(0xFCA5A5, 0.96)
+            } else {
+                C_TEXT
+            };
+            draw_text(dc, item.label, self.fonts.menu, &tr, tc, TextAlign::Left, false, false);
+        }
     }
 }
 
@@ -1643,5 +1655,69 @@ mod tests {
         let ccx = (fl.close_btn.left + fl.close_btn.right) / 2;
         let ccy = (fl.close_btn.top + fl.close_btn.bottom) / 2;
         assert_eq!(folder_hit_test(&fl, ccx, ccy, 3, 2, 1.25), FolderHit::Close);
+    }
+
+    #[test]
+    fn launchpad_folder_icon_and_context_menu_have_no_bottom_shadow() {
+        let mut renderer = super::Renderer::new().unwrap();
+        renderer.scale = 1.0;
+        let mut target = crate::ui::DibTarget::default();
+        assert!(target.ensure(320, 320));
+        let bg = crate::ui::rgb(0x405060, 1.0);
+        let bg_px = 0xFF40_5060u32;
+        let dc = target.mem_dc.unwrap();
+
+        // 1. 文件夹图标下方不应存在黑影像素（仅保留 1px 描边 AA 余量外全部与背景一致）
+        {
+            let mut sf = target.surface().unwrap();
+            sf.clear(bg);
+            renderer.paint_folder_icon(&mut sf, &[], 80.0, 80.0, 64.0, 0.225, false);
+            let slice = unsafe { std::slice::from_raw_parts(target.ptr as *const u32, 320 * 320) };
+            for dy in 2..=6 {
+                let py = 80 + 32 + dy;
+                assert_eq!(slice[py * 320 + 80], bg_px, "unexpected shadow below folder icon at dy={dy}");
+            }
+        }
+
+        // 2. 右键菜单下方不应存在黑影像素
+        {
+            let mut sf = target.surface().unwrap();
+            sf.clear(bg);
+            let menu = super::ContextMenu::build(
+                40,
+                40,
+                320,
+                320,
+                vec![
+                    super::ContextItem { cmd: super::ContextCmd::Open, label: "打开", danger: false },
+                    super::ContextItem { cmd: super::ContextCmd::Remove, label: "从启动台移除", danger: true },
+                ],
+                1.0,
+            );
+            renderer.paint_context_menu(&mut sf, dc, &menu);
+            let slice = unsafe { std::slice::from_raw_parts(target.ptr as *const u32, 320 * 320) };
+            let mcx = ((menu.rect.left + menu.rect.right) / 2) as usize;
+            for dy in 2..=8 {
+                let py = menu.rect.bottom as usize + dy;
+                assert_eq!(slice[py * 320 + mcx], bg_px, "unexpected shadow below context menu at dy={dy}");
+            }
+        }
+        target.release();
+    }
+
+    #[test]
+    fn icon_cache_trim_icons_respects_budget() {
+        let mut cache = super::IconCache::new();
+        let px = crate::ui::IconPixels {
+            w: 192,
+            h: 192,
+            px: std::sync::Arc::new(vec![255u8; 192 * 192 * 4]),
+        };
+        for i in 0..8 {
+            cache.insert(format!("k{i}"), px.clone());
+        }
+        cache.trim_icons_to(300 * 1024);
+        let kept = (0..8).filter(|i| cache.contains(&format!("k{i}"))).count();
+        assert_eq!(kept, 2);
     }
 }

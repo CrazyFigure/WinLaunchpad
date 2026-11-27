@@ -1021,7 +1021,7 @@ impl App {
 
     /// 优先加载当前可视页图标，确保启动台首帧零阻塞立即呈现。
     pub fn request_current_page_icons(&mut self) {
-        let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
+        let size = crate::icons::MASTER_ICON_SIZE;
         let items = self.page_items();
         self.request_icons_for_items(&items, size);
         self.request_open_folder_icons();
@@ -1031,7 +1031,7 @@ impl App {
         let Some((fl, pages)) = self.open_folder_layout() else {
             return;
         };
-        let size = (fl.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
+        let size = crate::icons::MASTER_ICON_SIZE;
         let per = fl.cells.len().max(1);
         let cur = self.open_folder_page_items(per, self.folder_page);
         self.request_icons_for_items(&cur, size);
@@ -1047,7 +1047,7 @@ impl App {
 
     /// 预取左右相邻页图标，保证滑动翻页瞬间即可显示。
     pub fn prefetch_neighbor_icons(&mut self) {
-        let size = (self.layout.icon_size.max(64) as f32).clamp(48.0, 160.0) as u32;
+        let size = crate::icons::MASTER_ICON_SIZE;
         if self.page + 1 < self.pages() {
             let items = self.items_for_page(self.page + 1);
             self.request_icons_for_items(&items, size);
@@ -1064,8 +1064,7 @@ impl App {
     }
 
     pub fn request_icon_async(&mut self, key: &str) {
-        let size = (64.0 * self.scale.max(1.0)).round().clamp(48.0, 144.0) as u32;
-        self.ensure_icon_loaded(key, size);
+        self.ensure_icon_loaded(key, crate::icons::MASTER_ICON_SIZE);
     }
 
     /// 打开外部链接或目录前收起启动台，避免置顶窗口与待弹出提醒遮挡新窗口。

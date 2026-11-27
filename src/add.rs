@@ -502,7 +502,7 @@ fn paint_dlg(dlg: &mut Dlg, app: &App) {
             let icx = rr.left as f32 + 22.0 * s;
             let icy = (rr.top + rr.bottom) as f32 * 0.5;
             if let Some(icon) = app.cached_icon(&e.icon_key) {
-                surface.draw_icon_bilinear(&icon, icx, icy, icon_sz, false, 0.0);
+                surface.draw_icon_resampled(&icon, icx, icy, icon_sz);
             } else {
                 let half = icon_sz * 0.5;
                 let ir = RECT {
