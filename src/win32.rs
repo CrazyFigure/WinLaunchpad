@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{w, HRESULT, PWSTR};
+use windows::core::{w, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
@@ -317,4 +317,216 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// 检测当前进程是否处于管理员（高完整性级别）权限。
+pub fn is_process_elevated() -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    static ELEVATED: OnceLock<bool> = OnceLock::new();
+    *ELEVATED.get_or_init(|| unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            tok,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        )
+        .is_ok();
+        let _ = CloseHandle(tok);
+        ok && elev.TokenIsElevated != 0
+    })
+}
+
+/// 获取当前进程令牌对应的用户 SID 字符串（例如 `S-1-5-21-...`）。
+pub fn current_user_sid() -> Option<String> {
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).is_err() {
+            return None;
+        }
+        let mut need = 0u32;
+        let _ = GetTokenInformation(tok, TokenUser, None, 0, &mut need);
+        if need == 0 {
+            let _ = CloseHandle(tok);
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let ok = GetTokenInformation(
+            tok,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut _),
+            need,
+            &mut need,
+        )
+        .is_ok();
+        let _ = CloseHandle(tok);
+        if !ok {
+            return None;
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_pwstr = PWSTR::null();
+        if ConvertSidToStringSidW(tu.User.Sid, &mut sid_pwstr).is_err() || sid_pwstr.0.is_null() {
+            return None;
+        }
+        let sid = sid_pwstr.to_string().ok();
+        let _ = LocalFree(HLOCAL(sid_pwstr.0 as *mut _));
+        sid
+    }
+}
+
+/// 当程序以管理员权限运行时，放行低权限进程（如资源管理器、Quicker）发来的指定窗口消息。
+pub fn allow_uipi_messages(hwnd: HWND, msgs: &[u32]) {
+    use windows::Win32::UI::WindowsAndMessaging::{ChangeWindowMessageFilterEx, MSGFLT_ALLOW};
+
+    if !is_process_elevated() || hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        for &msg in msgs {
+            if msg != 0 {
+                let _ = ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None);
+            }
+        }
+    }
+}
+
+/// 重启切换权限时等待旧进程退出，避免单实例互斥锁竞态拦截新实例。
+pub fn wait_for_process_exit(pid: u32, timeout_ms: u32) {
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            let _ = WaitForSingleObject(handle, timeout_ms);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+/// 经由当前桌面 Explorer 进程启动目标程序，使已提权的 WinLaunchpad 仍能以普通权限打开应用或重启自身。
+pub fn shell_execute_unelevated(
+    file: &str,
+    args: Option<&str>,
+    dir: Option<&str>,
+    verb: Option<&str>,
+    show: i32,
+) -> Result<(), String> {
+    use windows::core::{Interface, BSTR, VARIANT};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IServiceProvider, CLSCTX_ALL,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, IDispatch,
+    };
+    use windows::Win32::UI::Shell::{
+        IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView, IShellWindows,
+        ShellWindows, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    };
+
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let need_uninit = hr.is_ok();
+        let res = (|| -> windows::core::Result<()> {
+            let shell_windows: IShellWindows =
+                CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)?;
+            // 0 = CSIDL_DESKTOP，定位桌面 Shell 视图以便沿用 Explorer 的普通用户令牌
+            let vt_loc = VARIANT::from(0i32);
+            let vt_empty = VARIANT::default();
+            let mut hwnd = 0i32;
+            let disp = shell_windows.FindWindowSW(
+                &vt_loc,
+                &vt_empty,
+                SWC_DESKTOP,
+                &mut hwnd,
+                SWFO_NEEDDISPATCH,
+            )?;
+            let sp: IServiceProvider = disp.cast()?;
+            let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
+            let view: IShellView = browser.QueryActiveShellView()?;
+            let bg: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
+            let folder_view: IShellFolderViewDual = bg.cast()?;
+            let app_disp = folder_view.Application()?;
+            let shell_dispatch: IShellDispatch2 = app_disp.cast()?;
+            shell_dispatch.ShellExecute(
+                &BSTR::from(file),
+                &VARIANT::from(args.unwrap_or("")),
+                &VARIANT::from(dir.unwrap_or("")),
+                &VARIANT::from(verb.unwrap_or("")),
+                &VARIANT::from(show),
+            )
+        })();
+        if need_uninit {
+            CoUninitialize();
+        }
+        res.map_err(error_string)
+    }
+}
+
+/// 通过 UAC 请求以管理员身份重新启动当前程序。
+pub fn relaunch_elevated(args: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NO_CONSOLE, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let exe = exe_path();
+    let dir = exe.parent().map(|p| p.to_path_buf());
+    let w_exe = wide(&exe);
+    let w_args = wide(args);
+    let w_dir = dir.as_ref().map(wide);
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NO_CONSOLE,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(w_exe.as_ptr()),
+        lpParameters: if args.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(w_args.as_ptr())
+        },
+        lpDirectory: w_dir
+            .as_ref()
+            .map(|d| PCWSTR(d.as_ptr()))
+            .unwrap_or(PCWSTR::null()),
+        nShow: SW_SHOWNORMAL.0 as i32,
+        ..Default::default()
+    };
+    unsafe {
+        if ShellExecuteExW(&mut sei).is_ok() {
+            return Ok(());
+        }
+        let err = GetLastError();
+        if err == ERROR_CANCELLED {
+            Err("已取消管理员权限授权".into())
+        } else {
+            Err(error_text(err.0))
+        }
+    }
+}
+
+/// 从管理员进程降权以普通用户权限重新启动当前程序。
+pub fn relaunch_unelevated(args: &str) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let exe = exe_path();
+    let exe_str = exe.to_string_lossy().into_owned();
+    let dir_str = exe.parent().map(|p| p.to_string_lossy().into_owned());
+    shell_execute_unelevated(
+        &exe_str,
+        (!args.is_empty()).then_some(args),
+        dir_str.as_deref(),
+        None,
+        SW_SHOWNORMAL.0,
+    )
 }

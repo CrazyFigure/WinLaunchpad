@@ -92,19 +92,29 @@ fn main() {
             std::process::exit(i32::from(result.is_err()));
         }
     }
+    let wait_pid = args
+        .windows(2)
+        .find(|w| w[0] == "--wait-pid")
+        .and_then(|w| w[1].parse::<u32>().ok());
+    if let Some(pid) = wait_pid {
+        win32::wait_for_process_exit(pid, 5000);
+    }
     let background = args.iter().any(|a| a == "--background");
     let settings = args.iter().any(|a| a == "--settings");
+    let settings_gestures = args.iter().any(|a| a == "--settings-gestures");
     let add = args.iter().any(|a| a == "--add");
+    let enable_admin_mode = args.iter().any(|a| a == "--enable-admin-mode");
 
     unsafe {
         let _mutex = CreateMutexW(None, true, w!("Local\\WinLaunchpad-SingleInstance")).ok();
         let already = GetLastError() == ERROR_ALREADY_EXISTS;
         if already
-            && forward(match (settings, add, background) {
-                (true, _, _) => 3,
-                (_, true, _) => 4,
-                (_, _, false) => 1,
-                (_, _, true) => 0,
+            && forward(match (settings_gestures, settings, add, background) {
+                (true, _, _, _) => 5,
+                (_, true, _, _) => 3,
+                (_, _, true, _) => 4,
+                (_, _, _, false) => 1,
+                (_, _, _, true) => 0,
             })
         {
             return;
@@ -112,7 +122,7 @@ fn main() {
     }
 
     let hinst = win32::hinstance();
-    let app = match App::new(hinst) {
+    let mut app = match App::new(hinst) {
         Ok(a) => a,
         Err(e) => {
             let m = win32::wide(&format!("WinLaunchpad 初始化失败：{e}"));
@@ -127,6 +137,39 @@ fn main() {
             return;
         }
     };
+    // 已启用管理员模式且由普通权限交互式冷启动时，自动提权重启以兼容管理员窗口手势
+    if !background
+        && wait_pid.is_none()
+        && !enable_admin_mode
+        && !win32::is_process_elevated()
+        && app.settings.elevate_for_admin_windows
+    {
+        let mut fwd_args = Vec::new();
+        if settings_gestures {
+            fwd_args.push("--settings-gestures".to_string());
+        } else if settings {
+            fwd_args.push("--settings".to_string());
+        } else if add {
+            fwd_args.push("--add".to_string());
+        } else if args.iter().any(|a| a == "--toggle") {
+            fwd_args.push("--toggle".to_string());
+        }
+        fwd_args.push(format!("--wait-pid {}", std::process::id()));
+        match win32::relaunch_elevated(&fwd_args.join(" ")) {
+            Ok(()) => return,
+            Err(e) => log::log(&format!("请求管理员权限重启失败，改为普通权限运行: {e}")),
+        }
+    }
+    // 经由设置页提权重启后，确认当前确已具备管理员权限再持久化配置与开机任务
+    if enable_admin_mode && win32::is_process_elevated() {
+        app.settings.elevate_for_admin_windows = true;
+        app.store.save_settings(&app.settings);
+        if app.settings.start_with_windows || startup::state() == startup::StartupState::Enabled {
+            if let Err(e) = startup::set_enabled_with_elevation(true, true) {
+                log::log(&format!("切换管理员开机启动任务失败: {e}"));
+            }
+        }
+    }
     unsafe {
         register_class(hinst);
         let ptr = Box::into_raw(app);
@@ -160,7 +203,9 @@ fn main() {
         (*ptr).hwnd = hwnd;
         let app = &mut *ptr;
         app.post_init();
-        if settings {
+        if settings_gestures {
+            crate::settings::open_gestures(app);
+        } else if settings {
             crate::settings::open(app);
         } else if add {
             crate::add::open(app);

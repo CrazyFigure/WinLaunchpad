@@ -321,6 +321,8 @@ pub fn open(app: &mut App) {
         enable_rounded_window(hwnd);
         app.add_hwnd = hwnd;
         DragAcceptFiles(hwnd, true);
+        // 以管理员身份运行时放行普通权限资源管理器的拖拽消息
+        allow_uipi_messages(hwnd, &[WM_DROPFILES, WM_COPYDATA, 0x0049]);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }

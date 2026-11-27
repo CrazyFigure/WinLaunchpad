@@ -771,6 +771,8 @@ impl App {
 
     /// 窗口创建完成后调用：托盘、热键、图标与扫描调度、手势线程、事件监听线程。
     pub fn post_init(&mut self) {
+        // 以管理员身份运行时放行外部命令行唤醒消息及 Explorer 任务栏重建广播
+        allow_uipi_messages(self.hwnd, &[WM_APP_CMD, self.taskbar_created_msg]);
         self.hotkey = self.settings.hotkey;
         self.hotkey_active = hotkey::register(self.hwnd, self.hotkey);
         if !self.hotkey_active {
@@ -3118,6 +3120,7 @@ impl App {
                     2 => self.show(),
                     3 => crate::settings::open(self),
                     4 => crate::add::open(self),
+                    5 => crate::settings::open_gestures(self),
                     _ => self.toggle(),
                 }
                 LRESULT(0)

@@ -142,6 +142,9 @@ pub struct Settings {
     /// 手势识别最低匹配度百分比（50..=95，默认 70）
     #[serde(default = "default_gesture_threshold")]
     pub gesture_threshold: u8,
+    /// 是否以管理员权限运行以兼容 Geek、Uninstall Tool 等管理员窗口手势（默认关闭）
+    #[serde(default)]
+    pub elevate_for_admin_windows: bool,
     /// 启动台使用桌面壁纸毛玻璃背景
     #[serde(default = "default_true")]
     pub use_wallpaper_blur: bool,
@@ -198,6 +201,7 @@ impl Default for Settings {
             gestures_enabled: true,
             gesture_swap_lr: false,
             gesture_threshold: DEFAULT_GESTURE_THRESHOLD,
+            elevate_for_admin_windows: false,
             use_wallpaper_blur: true,
             icon_size_dp: default_icon_size(),
             icon_roundness: default_roundness(),
@@ -467,20 +471,23 @@ mod tests {
 
         assert!(fresh.gestures_enabled);
         assert!(!fresh.gesture_swap_lr);
+        assert!(!fresh.elevate_for_admin_windows);
         assert!(legacy.gestures_enabled);
         assert!(!legacy.gesture_swap_lr);
+        assert!(!legacy.elevate_for_admin_windows);
     }
 
     #[test]
     fn gesture_settings_respect_saved_preferences() {
         // 配置中的显式开关值优先于默认值。
         let saved: Settings = serde_json::from_str(
-            r#"{"version":2,"gestures_enabled":false,"gesture_swap_lr":true}"#,
+            r#"{"version":2,"gestures_enabled":false,"gesture_swap_lr":true,"elevate_for_admin_windows":true}"#,
         )
         .unwrap();
 
         assert!(!saved.gestures_enabled);
         assert!(saved.gesture_swap_lr);
+        assert!(saved.elevate_for_admin_windows);
     }
 
     #[test]

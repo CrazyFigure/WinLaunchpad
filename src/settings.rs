@@ -39,6 +39,7 @@ use crate::win32::*;
 const TIMER_TOOLTIP: usize = 201;
 const TIMER_UPDATE: usize = 202;
 const ID_FOLDER_SEARCH: i32 = 3001;
+const WM_APP_SELECT_GESTURES_TAB: u32 = WM_APP + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -158,6 +159,7 @@ enum Hit {
     // 鼠标手势
     ToggleGesture,
     ToggleGestureSwap,
+    ToggleGestureAdmin,
     GestureThreshDef,
     GestureThreshDec,
     GestureThreshInc,
@@ -185,6 +187,7 @@ struct Dlg {
     font_tip: HFONT,
     tab: Tab,
     start_with_windows: bool,
+    startup_disabled_by_system: bool,
     capture_hk: bool,
     hk_msg: Option<String>,
     categories: Vec<CategoryGroup>,
@@ -279,6 +282,8 @@ struct Layout {
     gesture_thresh_dec_btn: RECT,
     gesture_thresh_val_rc: RECT,
     gesture_thresh_inc_btn: RECT,
+    gesture_row4: RECT,
+    gesture_admin_toggle: RECT,
     gesture_cards: [RECT; 5],
     // Tab Refresh
     refresh_timer_card: RECT,
@@ -496,27 +501,29 @@ impl Dlg {
         let exp_row_h = s(46.0);
         let exp_vis = ((app_list_rc.bottom - app_list_rc.top) / exp_row_h).max(1) as usize;
 
-        // Tab Gestures（手势开关、方向反转、识别匹配度步进调节与下方五张只读手势卡）
-        let g_rh = s(44.0);
-        let gesture_card = RECT { left: content.left, top: content.top, right: content.right, bottom: content.top + g_rh * 3 };
+        // Tab Gestures（手势开关、方向反转、匹配度步进调节、管理员权限开关与下方五张只读手势卡）
+        let g_rh = s(40.0);
+        let gesture_card = RECT { left: content.left, top: content.top, right: content.right, bottom: content.top + g_rh * 4 };
         let gesture_row1 = RECT { left: gesture_card.left, top: gesture_card.top, right: gesture_card.right, bottom: gesture_card.top + g_rh };
         let gesture_row2 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh, right: gesture_card.right, bottom: gesture_card.top + g_rh * 2 };
-        let gesture_row3 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh * 2, right: gesture_card.right, bottom: gesture_card.bottom };
+        let gesture_row3 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh * 2, right: gesture_card.right, bottom: gesture_card.top + g_rh * 3 };
+        let gesture_row4 = RECT { left: gesture_card.left, top: gesture_card.top + g_rh * 3, right: gesture_card.right, bottom: gesture_card.bottom };
         let gesture_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row1.top + (g_rh - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row1.top + (g_rh + th) / 2 };
         let gesture_swap_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row2.top + (g_rh - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row2.top + (g_rh + th) / 2 };
+        let gesture_admin_toggle = RECT { left: gesture_card.right - s(18.0) - tw, top: gesture_row4.top + (g_rh - th) / 2, right: gesture_card.right - s(18.0), bottom: gesture_row4.top + (g_rh + th) / 2 };
 
         let g_step_right = gesture_card.right - s(18.0);
         let g_val_w = s(76.0);
-        let gesture_thresh_inc_btn = RECT { left: g_step_right - inc_w, top: gesture_row3.top + s(8.0), right: g_step_right, bottom: gesture_row3.bottom - s(8.0) };
-        let gesture_thresh_val_rc = RECT { left: gesture_thresh_inc_btn.left - s(4.0) - g_val_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_inc_btn.left - s(4.0), bottom: gesture_row3.bottom - s(8.0) };
-        let gesture_thresh_dec_btn = RECT { left: gesture_thresh_val_rc.left - s(4.0) - dec_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_val_rc.left - s(4.0), bottom: gesture_row3.bottom - s(8.0) };
-        let gesture_thresh_def_btn = RECT { left: gesture_thresh_dec_btn.left - s(10.0) - auto_w, top: gesture_row3.top + s(8.0), right: gesture_thresh_dec_btn.left - s(10.0), bottom: gesture_row3.bottom - s(8.0) };
+        let gesture_thresh_inc_btn = RECT { left: g_step_right - inc_w, top: gesture_row3.top + s(6.0), right: g_step_right, bottom: gesture_row3.bottom - s(6.0) };
+        let gesture_thresh_val_rc = RECT { left: gesture_thresh_inc_btn.left - s(4.0) - g_val_w, top: gesture_row3.top + s(6.0), right: gesture_thresh_inc_btn.left - s(4.0), bottom: gesture_row3.bottom - s(6.0) };
+        let gesture_thresh_dec_btn = RECT { left: gesture_thresh_val_rc.left - s(4.0) - dec_w, top: gesture_row3.top + s(6.0), right: gesture_thresh_val_rc.left - s(4.0), bottom: gesture_row3.bottom - s(6.0) };
+        let gesture_thresh_def_btn = RECT { left: gesture_thresh_dec_btn.left - s(10.0) - auto_w, top: gesture_row3.top + s(6.0), right: gesture_thresh_dec_btn.left - s(10.0), bottom: gesture_row3.bottom - s(6.0) };
 
         // 预留卡片底部只读快捷键徽标高度，并保持上下卡片间距均衡
-        let g_top = gesture_card.bottom + s(12.0);
-        let g_gap = s(10.0);
+        let g_top = gesture_card.bottom + s(10.0);
+        let g_gap = s(8.0);
         let card_w3 = (cw - g_gap * 2) / 3;
-        let card_h = s(136.0);
+        let card_h = s(124.0);
         let g0 = RECT { left: content.left, top: g_top, right: content.left + card_w3, bottom: g_top + card_h };
         let g1 = RECT { left: g0.right + g_gap, top: g_top, right: g0.right + g_gap + card_w3, bottom: g_top + card_h };
         let g2 = RECT { left: g1.right + g_gap, top: g_top, right: content.right, bottom: g_top + card_h };
@@ -570,6 +577,7 @@ impl Dlg {
             app_list_rc, app_scroll_rc, app_row_h, app_vis, exp_row_h, exp_vis,
             gesture_card, gesture_row1, gesture_toggle, gesture_row2, gesture_swap_toggle,
             gesture_row3, gesture_thresh_def_btn, gesture_thresh_dec_btn, gesture_thresh_val_rc, gesture_thresh_inc_btn,
+            gesture_row4, gesture_admin_toggle,
             gesture_cards,
             refresh_timer_card, refresh_interval_row, refresh_interval_presets, refresh_on_show_row, refresh_on_show_toggle,
             refresh_event_card, refresh_event_row, refresh_event_toggle, refresh_icons_row, refresh_icons_toggle,
@@ -1245,6 +1253,9 @@ impl Dlg {
                 if inside(&l.gesture_thresh_val_rc, x, y) || inside(&l.gesture_row3, x, y) {
                     return Hit::GestureThreshVal;
                 }
+                if inside(&l.gesture_admin_toggle, x, y) || inside(&l.gesture_row4, x, y) {
+                    return Hit::ToggleGestureAdmin;
+                }
                 for (i, r) in l.gesture_cards.iter().enumerate() {
                     if inside(r, x, y) {
                         return Hit::GestureCard(i);
@@ -1265,8 +1276,19 @@ impl Dlg {
 }
 
 pub fn open(app: &mut App) {
+    open_tab(app, Tab::General);
+}
+
+pub fn open_gestures(app: &mut App) {
+    open_tab(app, Tab::Gestures);
+}
+
+fn open_tab(app: &mut App, initial_tab: Tab) {
     unsafe {
         if !app.settings_hwnd.is_invalid() && IsWindow(app.settings_hwnd).as_bool() {
+            if initial_tab == Tab::Gestures {
+                let _ = SendMessageW(app.settings_hwnd, WM_APP_SELECT_GESTURES_TAB, WPARAM(0), LPARAM(0));
+            }
             let _ = SetForegroundWindow(app.settings_hwnd);
             return;
         }
@@ -1292,8 +1314,9 @@ pub fn open(app: &mut App) {
             font_btn: HFONT::default(),
             font_edit: HFONT::default(),
             font_tip: HFONT::default(),
-            tab: Tab::General,
+            tab: initial_tab,
             start_with_windows: st == startup::StartupState::Enabled,
+            startup_disabled_by_system: st == startup::StartupState::DisabledBySystem,
             capture_hk: false,
             hk_msg: None,
             categories: Vec::new(),
@@ -1515,6 +1538,14 @@ fn update_tip(dlg: &mut Dlg, app: &App, l: &Layout, hit: Hit) {
             l.gesture_swap_toggle,
             "反转向左/向右划对应的虚拟桌面切换方向".into(),
         )),
+        Hit::ToggleGestureAdmin => {
+            let msg = if is_process_elevated() {
+                "当前已以管理员身份运行，手势可响应 Geek、Uninstall Tool 等管理员窗口（关闭后将重启为普通权限）"
+            } else {
+                "开启后将以管理员权限重启，使手势可在 Geek、Uninstall Tool、任务管理器等管理员窗口中使用"
+            };
+            Some((Hit::ToggleGestureAdmin, l.gesture_admin_toggle, msg.into()))
+        }
         Hit::GestureThreshDef => Some((
             Hit::GestureThreshDef,
             l.gesture_thresh_def_btn,
@@ -1854,7 +1885,7 @@ fn paint_tab_general(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: win
     }
     sf.fill_rect(&RECT { left: l.sys_card.left + (16.0 * s) as i32, top: l.wallpaper_row.top, right: l.sys_card.right - (16.0 * s) as i32, bottom: l.wallpaper_row.top + 1 }, rgb(0xE2E8F0, 1.0));
 
-    let st_sys_disabled = startup::state() == startup::StartupState::DisabledBySystem;
+    let st_sys_disabled = dlg.startup_disabled_by_system;
     let st_label = if st_sys_disabled {
         "开机启动（已被系统任务管理器禁用）"
     } else {
@@ -2542,16 +2573,22 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
     if dlg.hover == Hit::ToggleGestureSwap {
         sf.fill_rrect(&l.gesture_row2, 10.0 * s, rgb(0xF1F5F9, 0.7));
     }
-    for sep_y in [l.gesture_row2.top, l.gesture_row3.top] {
+    if dlg.hover == Hit::ToggleGestureAdmin {
+        sf.fill_rrect(&l.gesture_row4, 10.0 * s, rgb(0xF1F5F9, 0.7));
+    }
+    for sep_y in [l.gesture_row2.top, l.gesture_row3.top, l.gesture_row4.top] {
         sf.fill_rect(&RECT { left: l.gesture_card.left + (16.0 * s) as i32, top: sep_y, right: l.gesture_card.right - (16.0 * s) as i32, bottom: sep_y + 1 }, rgb(0xE2E8F0, 1.0));
     }
 
     let r1 = RECT { left: l.gesture_row1.left + (18.0 * s) as i32, top: l.gesture_row1.top, right: l.gesture_toggle.left - (12.0 * s) as i32, bottom: l.gesture_row1.bottom };
     let r2 = RECT { left: l.gesture_row2.left + (18.0 * s) as i32, top: l.gesture_row2.top, right: l.gesture_swap_toggle.left - (12.0 * s) as i32, bottom: l.gesture_row2.bottom };
+    let r4 = RECT { left: l.gesture_row4.left + (18.0 * s) as i32, top: l.gesture_row4.top, right: l.gesture_admin_toggle.left - (12.0 * s) as i32, bottom: l.gesture_row4.bottom };
     draw_text(dc, "启用全局右键手势", dlg.font_body, &r1, rgb(0x111827, 1.0), TextAlign::Left, true, false);
     draw_text(dc, "左右手势切换桌面方向反转", dlg.font_body, &r2, rgb(0x111827, 1.0), TextAlign::Left, true, false);
+    draw_text(dc, "以管理员身份运行", dlg.font_body, &r4, rgb(0x111827, 1.0), TextAlign::Left, true, false);
     draw_toggle(sf, &l.gesture_toggle, app.settings.gestures_enabled, dlg.hover == Hit::ToggleGesture, dlg.pressed == Hit::ToggleGesture, s);
     draw_toggle(sf, &l.gesture_swap_toggle, app.settings.gesture_swap_lr, dlg.hover == Hit::ToggleGestureSwap, dlg.pressed == Hit::ToggleGestureSwap, s);
+    draw_toggle(sf, &l.gesture_admin_toggle, is_process_elevated(), dlg.hover == Hit::ToggleGestureAdmin, dlg.pressed == Hit::ToggleGestureAdmin, s);
 
     // 复用通用步进控件展示手势识别最低匹配度百分比（50%–95%，默认 70%）
     let thresh = clamp_gesture_threshold(app.settings.gesture_threshold);
@@ -2570,19 +2607,19 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
         sf.fill_rrect(cr, 10.0 * s, if hov { rgb(0xF8FAFC, 1.0) } else { rgb(0xFFFFFF, 1.0) });
         sf.stroke_rrect(cr, 10.0 * s, (1.1 * s).max(1.0), if hov { rgb(0x93C5FD, 1.0) } else { rgb(0xE2E8F0, 1.0) });
         let gcx = (cr.left + cr.right) as f32 * 0.5;
-        let gcy = cr.top as f32 + 34.0 * s;
-        draw_gesture_glyph(sf, gcx, gcy, 42.0 * s, spec.glyph, s);
+        let gcy = cr.top as f32 + 30.0 * s;
+        draw_gesture_glyph(sf, gcx, gcy, 38.0 * s, spec.glyph, s);
         let nr = RECT {
             left: cr.left + (8.0 * s).round() as i32,
-            top: cr.top + (59.0 * s).round() as i32,
+            top: cr.top + (52.0 * s).round() as i32,
             right: cr.right - (8.0 * s).round() as i32,
-            bottom: cr.top + (80.0 * s).round() as i32,
+            bottom: cr.top + (72.0 * s).round() as i32,
         };
         let ar = RECT {
             left: cr.left + (8.0 * s).round() as i32,
-            top: cr.top + (79.0 * s).round() as i32,
+            top: cr.top + (71.0 * s).round() as i32,
             right: cr.right - (8.0 * s).round() as i32,
-            bottom: cr.top + (97.0 * s).round() as i32,
+            bottom: cr.top + (89.0 * s).round() as i32,
         };
         draw_text(dc, spec.name, dlg.font_section, &nr, rgb(0x111827, 1.0), TextAlign::Center, true, false);
         draw_text(dc, spec.action, dlg.font_sub, &ar, rgb(0x64748B, 1.0), TextAlign::Center, true, false);
@@ -2595,9 +2632,9 @@ fn paint_tab_gestures(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: wi
         let pill_cx = (cr.left + cr.right) / 2;
         let pill_rc = RECT {
             left: pill_cx - pill_w / 2,
-            top: cr.top + (102.0 * s).round() as i32,
+            top: cr.top + (94.0 * s).round() as i32,
             right: pill_cx + (pill_w - pill_w / 2),
-            bottom: cr.bottom - (11.0 * s).round() as i32,
+            bottom: cr.bottom - (9.0 * s).round() as i32,
         };
         let pill_tc = if hov { rgb(0x334155, 1.0) } else { rgb(0x475569, 1.0) };
         sf.fill_rrect(&pill_rc, 6.0 * s, rgb(0xF1F5F9, 1.0));
@@ -2751,6 +2788,14 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             WM_APP_AUTO_UPDATE => {
                 dlg.about.sync_available(app.available_update.as_ref());
+                let _ = InvalidateRect(hwnd, None, false);
+                LRESULT(0)
+            }
+            WM_APP_SELECT_GESTURES_TAB => {
+                dlg.tab = Tab::Gestures;
+                dlg.capture_hk = false;
+                dlg.hk_msg = None;
+                dlg.sync_search_edit_pos();
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
@@ -2938,9 +2983,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         }
                         Hit::ToggleStartup => {
                             let next = !dlg.start_with_windows;
-                            match startup::set_enabled(next) {
+                            let elevate = app.settings.elevate_for_admin_windows && is_process_elevated();
+                            match startup::set_enabled_with_elevation(next, elevate) {
                                 Ok(_) => {
                                     dlg.start_with_windows = next;
+                                    dlg.startup_disabled_by_system =
+                                        startup::state() == startup::StartupState::DisabledBySystem;
                                     app.settings.start_with_windows = next;
                                     app.store.save_settings(&app.settings);
                                 }
@@ -3214,6 +3262,44 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         Hit::ToggleGestureSwap => {
                             app.settings.gesture_swap_lr = !app.settings.gesture_swap_lr;
                             app.store.save_settings(&app.settings);
+                        }
+                        Hit::ToggleGestureAdmin => {
+                            let pid = std::process::id();
+                            if !is_process_elevated() {
+                                let args = format!("--wait-pid {pid} --settings-gestures --enable-admin-mode");
+                                match relaunch_elevated(&args) {
+                                    Ok(()) => {
+                                        let _ = DestroyWindow(hwnd);
+                                        let _ = PostMessageW(app.hwnd, WM_APP_UPDATE_EXIT, WPARAM(0), LPARAM(0));
+                                        return LRESULT(0);
+                                    }
+                                    Err(e) => {
+                                        if e != "已取消管理员权限授权" {
+                                            let m = wide(&e);
+                                            let _ = MessageBoxW(hwnd, PCWSTR(m.as_ptr()), w!("管理员权限运行"), MB_OK | MB_ICONWARNING);
+                                        }
+                                    }
+                                }
+                            } else {
+                                app.settings.elevate_for_admin_windows = false;
+                                app.store.save_settings(&app.settings);
+                                if app.settings.start_with_windows || startup::state() != startup::StartupState::Off {
+                                    let _ = startup::set_enabled_with_elevation(app.settings.start_with_windows, false);
+                                }
+                                let args = format!("--wait-pid {pid} --settings-gestures");
+                                match relaunch_unelevated(&args) {
+                                    Ok(()) => {
+                                        let _ = DestroyWindow(hwnd);
+                                        let _ = PostMessageW(app.hwnd, WM_APP_UPDATE_EXIT, WPARAM(0), LPARAM(0));
+                                        return LRESULT(0);
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("已关闭管理员启动模式，但未能自动切换为普通权限实例（{e}），请从系统托盘退出后重新打开。");
+                                        let m = wide(&msg);
+                                        let _ = MessageBoxW(hwnd, PCWSTR(m.as_ptr()), w!("管理员权限运行"), MB_OK | MB_ICONWARNING);
+                                    }
+                                }
+                            }
                         }
                         Hit::GestureThreshDef => {
                             if app.settings.gesture_threshold != DEFAULT_GESTURE_THRESHOLD {

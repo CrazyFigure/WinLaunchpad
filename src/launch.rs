@@ -35,13 +35,33 @@ pub fn launch(entry: &AppEntry) -> Result<(), String> {
 }
 
 unsafe fn launch_inner(entry: &AppEntry) -> Result<(), String> {
+    let show = windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL.0 as i32;
+    let explicit_missing = !entry.target.is_empty()
+        && !entry.target.starts_with("shell:")
+        && !entry.target.contains('%')
+        && (entry.target.contains('\\') || entry.target.contains('/'))
+        && !std::path::Path::new(&entry.target).exists();
+    // 主进程以管理员身份运行时，优先委托桌面 Explorer 以普通用户权限拉起存在的目标应用
+    if !explicit_missing
+        && crate::win32::is_process_elevated()
+        && crate::win32::shell_execute_unelevated(
+            &entry.target,
+            (!entry.args.is_empty()).then_some(entry.args.as_str()),
+            None,
+            None,
+            show,
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
     let target = wide(&entry.target);
     let args = wide(&entry.args);
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOASYNC | SEE_MASK_NO_CONSOLE,
         lpFile: PCWSTR(target.as_ptr()),
-        nShow: windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL.0 as i32,
+        nShow: show,
         ..Default::default()
     };
     if !entry.args.is_empty() {
